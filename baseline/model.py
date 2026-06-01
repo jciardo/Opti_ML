@@ -39,30 +39,67 @@ class PosEmbed(nn.Module):
     def forward(self, x):
         return x+self.W_pos[:x.shape[-2]]
 
-@dataclass(frozen = True)
-class Config():
-    lr: float = 1e-3
-    weight_decay: float = 1.0 
-    p: int = 113 
-    d_model: int = 128 
-    fn_name: str = 'add' #['add', 'subtract','mult','rand']
-    frac_train: float = 0.3
-    num_epochs: int = 50000 
-    save_models: bool = False 
+
+# @dataclass(frozen = True)
+# class Config():
+#     lr: float = 1e-3
+#     weight_decay: float = 1.0 
+#     p: int = 113 
+#     d_model: int = 128 
+#     fn_name: str = 'add' #['add', 'subtract','mult','rand']
+#     frac_train: float = 0.3
+#     num_epochs: int = 50000 
+#     save_models: bool = False 
  
 
-    # Stop training when test loss is < stopping_thresh
-    stopping_thresh: int = -1 #@param
+#     # Stop training when test loss is < stopping_thresh
+#     stopping_thresh: int = -1 #@param
+#     seed: int = 0
+
+#     num_layers: int = 1
+#     batch_style: str = 'full'
+#     d_vocab: Optional[int] = None
+#     n_ctx: int = 3
+#     d_mlp: Optional[int] = None
+#     num_heads: int = 4
+
+#     act_type: str = 'ReLU' #@param ['ReLU', 'GeLU']
+
+#     device: t.device = (
+#         t.device("cuda") if t.cuda.is_available()
+#         else t.device("mps") if t.backends.mps.is_available()
+#         else t.device("cpu")
+#     )
+
+#     use_ln: bool = False
+
+#     def __post_init__(self):
+#         if self.d_vocab is None:
+#             object.__setattr__(self, "d_vocab", self.p + 1)
+#         if self.d_mlp is None:
+#             object.__setattr__(self, "d_mlp", 4 * self.d_model)
+
+#     @property
+#     def d_head(self):
+#         return self.d_model // self.num_heads
+
+
+@dataclass(frozen=True)
+class Config:
+    p: int = 113
+    frac_train: float = 0.3
     seed: int = 0
 
-    num_layers: int = 1
-    batch_style: str = 'full'
-    d_vocab: Optional[int] = None
-    n_ctx: int = 3
+    d_model: int = 128
     d_mlp: Optional[int] = None
     num_heads: int = 4
+    num_layers: int = 1
+    n_ctx: int = 3
+    d_vocab: Optional[int] = None
+    act_type: str = 'ReLU'
+    use_ln: bool = False
 
-    act_type: str = 'ReLU' #@param ['ReLU', 'GeLU']
+    num_epochs: int = 40_000
 
     device: t.device = (
         t.device("cuda") if t.cuda.is_available()
@@ -70,18 +107,15 @@ class Config():
         else t.device("cpu")
     )
 
-    use_ln: bool = False
-
     def __post_init__(self):
         if self.d_vocab is None:
-            object.__setattr__(self, "d_vocab", self.p + 1)
+            object.__setattr__(self, 'd_vocab', self.p + 1)
         if self.d_mlp is None:
-            object.__setattr__(self, "d_mlp", 4 * self.d_model)
+            object.__setattr__(self, 'd_mlp', 4 * self.d_model)
 
     @property
-    def d_head(self):
+    def d_head(self) -> int:
         return self.d_model // self.num_heads
-
 
 class Attention(nn.Module):
     def __init__(self, d_model, num_heads, d_head, n_ctx, model):
@@ -140,6 +174,7 @@ class MLP(nn.Module):
             x = F.relu(x)
         elif self.act_type=='GeLU':
             x = F.gelu(x)
+        self.post_act = x  # exposed for Fourier analysis (Nanda progress measures)
         x = t.einsum('dm,bpm->bpd', self.W_out, x) + self.b_out
         return x
     
