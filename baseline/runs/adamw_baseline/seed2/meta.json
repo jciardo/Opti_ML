@@ -2,7 +2,7 @@
   "label": "adamw_baseline_seed2",
   "seed": 2,
   "epoch": 25000,
-  "saved_at": "2026-06-01T17:59:07",
+  "saved_at": "2026-06-02T11:25:47",
   "config": {
     "p": 113,
     "frac_train": 0.3,

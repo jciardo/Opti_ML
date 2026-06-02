@@ -1,8 +1,8 @@
 {
-  "label": "adamw_baseline_seed1",
+  "label": "lr0.0003__weight_decay1_seed1",
   "seed": 1,
   "epoch": 25000,
-  "saved_at": "2026-06-02T11:20:13",
+  "saved_at": "2026-06-02T14:37:34",
   "config": {
     "p": 113,
     "frac_train": 0.3,
@@ -20,7 +20,7 @@
   "specs": [
     {
       "name": "adamw",
-      "lr": 0.001,
+      "lr": 0.0003,
       "weight_decay": 1.0,
       "extra": {
         "betas": [

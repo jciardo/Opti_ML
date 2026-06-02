@@ -3,10 +3,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 import torch as t
 import torch.nn as nn
-from old.muon import Muon  #? Maybe import the Muon 
+from optimizer.muon import SingleDeviceMuon as Muon  # single-GPU variant of Keller Jordan's Muon
+from optimizer.soap import SOAP                       
 
 
-ParamFilter = Callable[[str, t.Tensor], bool] # type alias: a filter takes (param_name, tensor) and returns whether this
+ParamFilter = Callable[[str, t.Tensor], bool] 
 
 
 
@@ -18,8 +19,8 @@ class OptimizerSpec:
     Fields
     ------
     name : str
-        Identifier of the algorithm. Currently supported: 'adamw', 'muon', 'sgd'.
-        Adding a new optimizer = adding one branch in `build_optimizers`.
+        Identifier of the algorithm. Currently supported: 'adamw', 'muon', 'sgd', 'soap'.
+        Adding a new optimizer = adding one entry in `_OPTIMIZER_REGISTRY`.
 
     lr : float
         Learning rate.
@@ -58,7 +59,7 @@ class OptimizerSpec:
 # Contains all the optimizers we will use 
 #! ==> to be completed with soap etc... !!
 _OPTIMIZER_REGISTRY: dict[str, Callable] = {}
-
+#! On pourrait mettre une fonction pour ajouter optimiser depuis API mais autant tout faire direct ici... 
 
 def _register_default_optimizers():
     """Populate the registry with the optimizers supported out of the box."""
@@ -68,16 +69,20 @@ def _register_default_optimizers():
         return optim.AdamW(params, lr=lr, weight_decay=weight_decay, **extra)
 
     def _build_muon(params, lr, weight_decay, **extra):
-        return Muon(params, lr=lr, weight_decay=weight_decay, **extra)   #! doit pouvoir etre appelé de la sorte, avec **extra !!
+        return Muon(params, lr=lr, weight_decay=weight_decay, **extra)  
 
     def _build_sgd(params, lr, weight_decay, **extra):
         return optim.SGD(params, lr=lr, weight_decay=weight_decay, **extra)
-    
+
+    def _build_soap(params, lr, weight_decay, **extra):
+        return SOAP(params, lr=lr, weight_decay=weight_decay, **extra)
+
     #! add new optimizers here !!
 
     _OPTIMIZER_REGISTRY['adamw'] = _build_adamw
     _OPTIMIZER_REGISTRY['muon']  = _build_muon
     _OPTIMIZER_REGISTRY['sgd']   = _build_sgd
+    _OPTIMIZER_REGISTRY['soap']  = _build_soap
 
 
 _register_default_optimizers()
@@ -244,10 +249,19 @@ class Trainer:
             # Fast eval (every `eval_every` epochs)
             'epoch': [], 'train_loss': [], 'test_loss': [],
             'train_acc': [], 'test_acc': [],
+            'l2_norm': [],   # sum_i ||W_i||^2 — cheap, tracked at eval frequency
+            # L2 decomposed by module group (Nanda cleanup analysis)
+            'l2_embed': [], 'l2_attn': [], 'l2_mlp': [], 'l2_unembed': [],
+            # Optimizer dynamics (captured on the step immediately before each eval)
+            'grad_norm': [],            # ||grad|| of the last step
+            'update_norm': [],          # ||theta_{t+1} - theta_t|| over all params
+            'update_norm_per_opt': [],  # same, decomposed per optimizer
+            # Wall-clock seconds since the previous eval (epoch=0 entry: since init)
+            'eval_wallclock': [],
             # Fourier progress measures (every `fourier_every` epochs)
             'fourier_epoch': [], 'key_freqs': [],
             'restricted_loss': [], 'excluded_loss': [], 'excluded_loss_mean': [],
-            'l2_norm': [], 'gini_W_E': [], 'gini_W_L': [],
+            'gini_W_E': [], 'gini_W_L': [],
         }
 
     def __init__(
@@ -327,18 +341,71 @@ class Trainer:
             'on_epoch_end': [],
         }
 
+        # --- Optimizer diagnostics setup ---
+        # Map each parameter (by id) to which optimizer owns it, so update_norm
+        # can be decomposed per-optimizer for hybrid setups (Muon + AdamW).
+        self._opt_param_id_sets: list[set] = [
+            {id(p) for group in opt.param_groups for p in group['params']}
+            for opt in self.optimizers
+        ]
+        # Buffers populated in step() (only on steps just before an eval), read
+        # in _take_eval_snapshot. None at epoch=0 (no step has happened yet).
+        self._last_grad_norm: Optional[float] = None
+        self._last_update_norm: Optional[float] = None
+        self._last_update_norm_per_opt: Optional[list[float]] = None
+        # Wall-clock anchor for the next eval delta.
+        import time as _time
+        self._last_eval_walltime: float = _time.perf_counter()
+
     def step(self) -> float:
         """One training step (forward + backward + optimizer step + scheduler step).
+
+        On the step whose result will be evaluated next (i.e. (epoch+1) % eval_every == 0),
+        also captures ||grad|| and ||update|| (total and per-optimizer) into
+        self._last_*; these are consumed by the next _take_eval_snapshot.
         """
         self.model.train()
+
+        # Decide whether to capture diagnostics this step (only ~1 step in eval_every).
+        capture_diag = ((self.epoch + 1) % self.eval_every == 0)
+        if capture_diag:
+            # Clone before the update so we can compute ||theta_after - theta_before||.
+            params_before = [p.detach().clone() for p in self.model.parameters()]
+
         logits = self.model(self.train_data)[:, -1, :self.config.p]
         labels = Trainer._labels_for(self.train_data, self.config.p)
         loss = cross_entropy_high_precision(logits, labels)
         loss.backward()
+
+        if capture_diag:
+            # ||grad|| over all params (post-backward, pre-step).
+            gn_sq_t = t.zeros((), device=self.device)
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    gn_sq_t = gn_sq_t + p.grad.detach().pow(2).sum()
+            self._last_grad_norm = gn_sq_t.sqrt().item()
+
         for opt in self.optimizers:
             opt.step()
         for sch in self.schedulers:
             sch.step()
+
+        if capture_diag:
+            # ||update|| total + decomposed per optimizer.
+            n_opt = len(self.optimizers)
+            un_per_opt_t = [t.zeros((), device=self.device) for _ in range(n_opt)]
+            total_sq_t   = t.zeros((), device=self.device)
+            for p, before in zip(self.model.parameters(), params_before):
+                d_sq = (p.detach() - before).pow(2).sum()
+                total_sq_t = total_sq_t + d_sq
+                pid = id(p)
+                for i, ids in enumerate(self._opt_param_id_sets):
+                    if pid in ids:
+                        un_per_opt_t[i] = un_per_opt_t[i] + d_sq
+                        break
+            self._last_update_norm = total_sq_t.sqrt().item()
+            self._last_update_norm_per_opt = [u.sqrt().item() for u in un_per_opt_t]
+
         for opt in self.optimizers:
             opt.zero_grad(set_to_none=True)
         return loss.item()
@@ -385,7 +452,7 @@ class Trainer:
 
         return self.history
 
-    def register_callback(self, event: str, fn: Callable): #! fait parti de l'API publique donc on pourra ajouer ce que on veur ici
+    def register_callback(self, event: str, fn: Callable): #! fait parti de l'API publique donc on pourra ajouer ce que on veut ici
         """Register a callback for one of the lifecycle events.
         Valid events: 'on_eval', 'on_fourier_snapshot', 'on_epoch_end'.
         """
@@ -401,14 +468,46 @@ class Trainer:
             cb(self)
 
     def _take_eval_snapshot(self):
+        import time as _time
         self.model.eval()
         tr_l, tr_a = self.evaluate(self.train_data)
         te_l, te_a = self.evaluate(self.test_data)
+
+        # L2 total + decomposition by module group.
+        l2_embed = l2_attn = l2_mlp = l2_unembed = 0.0
+        for name, p in self.model.named_parameters():
+            sq = p.detach().pow(2).sum().item()
+            if 'unembed' in name:
+                l2_unembed += sq
+            elif 'embed' in name:                 # covers W_E and W_pos
+                l2_embed += sq
+            elif 'attn' in name:
+                l2_attn += sq
+            elif 'mlp' in name:
+                l2_mlp += sq
+        l2 = l2_embed + l2_attn + l2_mlp + l2_unembed
+
         self.history['epoch'].append(self.epoch)
         self.history['train_loss'].append(tr_l)
         self.history['test_loss'].append(te_l)
         self.history['train_acc'].append(tr_a)
         self.history['test_acc'].append(te_a)
+        self.history['l2_norm'].append(l2)
+        self.history['l2_embed'].append(l2_embed)
+        self.history['l2_attn'].append(l2_attn)
+        self.history['l2_mlp'].append(l2_mlp)
+        self.history['l2_unembed'].append(l2_unembed)
+
+        # Optimizer diagnostics captured in step() (None at epoch=0).
+        self.history['grad_norm'].append(self._last_grad_norm)
+        self.history['update_norm'].append(self._last_update_norm)
+        self.history['update_norm_per_opt'].append(self._last_update_norm_per_opt)
+
+        # Wall-clock seconds elapsed since the previous eval.
+        now = _time.perf_counter()
+        self.history['eval_wallclock'].append(now - self._last_eval_walltime)
+        self._last_eval_walltime = now
+
         if self.verbose_every and self.epoch % self.verbose_every == 0:
             print(f"  [{self.label} seed={self.seed}] epoch {self.epoch:5d} "
                   f"| train acc {tr_a:.3f} | test acc {te_a:.3f}")
@@ -422,8 +521,10 @@ class Trainer:
                 self.is_train, self.is_test,
             )
             self.history['fourier_epoch'].append(self.epoch)
+            # NOTE: 'l2_norm' is no longer logged here — it's tracked at every
+            # eval_every step in _take_eval_snapshot (cheaper + finer granularity).
             for k in ('key_freqs', 'restricted_loss', 'excluded_loss',
-                      'excluded_loss_mean', 'l2_norm', 'gini_W_E', 'gini_W_L'):
+                      'excluded_loss_mean', 'gini_W_E', 'gini_W_L'):
                 self.history[k].append(fm[k])
             self._dispatch('on_fourier_snapshot')
         except Exception as ex:
@@ -580,4 +681,273 @@ def run_multi_seed(
             print(f"  saved to {save_root}/seed{seed}/")
         results[seed] = trainer
     return results
+
+
+
+
+
+
+# =============================================================================
+# Grid search over hyperparameters
+# =============================================================================
+
+def first_epoch_above(history: dict, key: str, threshold: float) -> Optional[int]:
+    """Return the first epoch where history[key] crosses `threshold` (None if never)."""
+    for e, v in zip(history['epoch'], history[key]):
+        if v > threshold:
+            return e
+    return None
+
+
+def _combo_label(combo: tuple, keys: list[str]) -> str:
+    """Convert a (param_value, ...) tuple to a filesystem-safe folder name."""
+    parts = []
+    for k, v in zip(keys, combo):
+        if isinstance(v, (tuple, list)):
+            v_str = '-'.join(f"{x:g}" if isinstance(x, float) else str(x) for x in v)
+        elif isinstance(v, float):
+            v_str = f"{v:g}"
+        else:
+            v_str = str(v)
+        v_str = (v_str
+                 .replace('/', '_')
+                 .replace(' ', '')
+                 .replace('(', '')
+                 .replace(')', '')
+                 .replace(',', ''))
+        parts.append(f"{k}{v_str}")
+    return '__'.join(parts)
+
+
+
+def grid_search(
+    config,
+    spec_builder: Callable[..., list[OptimizerSpec]],
+    param_grid: dict[str, list],
+    seeds: list[int],
+    save_root: str,
+    num_epochs: Optional[int] = None,
+    **trainer_kwargs,
+) -> dict[tuple, dict[int, Trainer]]:
+    """Grid search over `param_grid` × seeds. Resume-tolerant.
+
+    Parameters
+    ----------
+    config : Config
+        Base configuration. If `num_epochs` is given, the config is replaced
+        with `num_epochs=num_epochs` (typical use: 25k for phase 1 search).
+    spec_builder : Callable
+        Function that takes named kwargs (matching `param_grid` keys) and
+        returns a list of OptimizerSpec. This is the modular extension point:
+        you can build any spec configuration from any set of hyperparameters.
+
+        Example for AdamW:
+            def make_adamw(lr, weight_decay):
+                return [OptimizerSpec('adamw', lr=lr, weight_decay=weight_decay,
+                                       extra={'betas': (0.9, 0.98)})]
+
+        Example for Muon hybrid:
+            def make_muon_hybrid(lr_muon, wd_muon):
+                return [
+                    OptimizerSpec('muon', lr=lr_muon, weight_decay=wd_muon,
+                                  param_filter=lambda n, p: p.ndim >= 2
+                                                            and 'embed' not in n,
+                                  extra={'momentum': 0.95}),
+                    OptimizerSpec('adamw', lr=1e-3, weight_decay=1.0,
+                                  extra={'betas': (0.9, 0.98)}),
+                ]
+
+    param_grid : dict[str, list]
+        Maps parameter name to list of values. Cartesian product is iterated.
+        Example: {'lr': [1e-3, 5e-3], 'weight_decay': [0.3, 1.0]}
+
+    seeds : list[int]
+        Seeds to run per combination (typically 2-3 in phase 1, 5+ in phase 2).
+
+    save_root : str
+        Parent folder. Each combination is saved at
+            <save_root>/<combo_label>/seed{N}/
+        which makes resume trivial.
+
+    num_epochs : Optional[int]
+        Override config.num_epochs (e.g. 25_000 for phase 1).
+
+    **trainer_kwargs
+        Forwarded to Trainer (eval_every, fourier_every, warmup_steps,
+        verbose_every, verbose_build).
+
+    Returns
+    -------
+    dict[tuple, dict[int, Trainer]]
+        {combo_tuple: {seed: trainer}}. Use `aggregate_grid` to analyse.
+
+    Notes
+    -----
+    Resume: if a seed folder already exists, it is reloaded via Trainer.from_run
+    (with the same `spec_builder` to handle param_filter lambdas). Only missing
+    seeds are actually trained.
+    """
+    import os
+    import itertools
+    import dataclasses
+
+    if num_epochs is not None:
+        config = dataclasses.replace(config, num_epochs=num_epochs)
+
+    keys = list(param_grid.keys())
+    value_lists = [param_grid[k] for k in keys]
+    all_combos = list(itertools.product(*value_lists))
+
+    print(f"\n=== grid_search: {len(all_combos)} combinations × {len(seeds)} seeds "
+          f"= {len(all_combos) * len(seeds)} runs ===")
+    print(f"   params : {keys}")
+    print(f"   save   : {save_root}/")
+    print()
+
+    results: dict[tuple, dict[int, Trainer]] = {}
+
+    for combo_idx, combo in enumerate(all_combos):
+        params = dict(zip(keys, combo))
+        label = _combo_label(combo, keys)
+        combo_folder = os.path.join(save_root, label)
+
+        print(f"--- [{combo_idx+1}/{len(all_combos)}] {label} ---")
+
+        # Resume: reload existing seeds from disk
+        existing: dict[int, Trainer] = {}
+        if os.path.exists(combo_folder):
+            specs_for_reload = spec_builder(**params)
+            for d in sorted(os.listdir(combo_folder)):
+                if d.startswith('seed'):
+                    seed = int(d.replace('seed', ''))
+                    if seed in seeds:
+                        try:
+                            existing[seed] = Trainer.from_run(
+                                os.path.join(combo_folder, d),
+                                specs=specs_for_reload,
+                            )
+                        except Exception as ex:
+                            print(f"   ⚠ could not reload seed{seed}: {ex}")
+
+        missing = [s for s in seeds if s not in existing]
+        if existing:
+            print(f"   already done : {sorted(existing)}")
+        if missing:
+            print(f"   will run     : {missing}")
+
+        if missing:
+            specs = spec_builder(**params)
+            new_runs = run_multi_seed(
+                config, specs, seeds=missing,
+                label_prefix=label,
+                save_root=combo_folder,
+                **trainer_kwargs,
+            )
+            existing.update(new_runs)
+
+        results[combo] = existing
+
+    print(f"\n=== grid_search complete: {len(results)} combinations done ===")
+    return results
+
+
+def aggregate_grid(
+    grid_results: dict[tuple, dict[int, 'Trainer']],
+    param_keys: list[str],
+    *,
+    acc_thresh: float = 0.99,
+    robustness_thresh: float = 0.5,
+) -> list[dict]:
+    """Reduce a grid_search result to a sorted table of {params + stats}.
+    """
+    import numpy as np
+
+    rows = []
+    for combo, seed_results in grid_results.items():
+        param_dict = dict(zip(param_keys, combo))
+        epochs_mem      = []   # epoch where train_acc crosses acc_thresh
+        epochs_grok     = []   # epoch where test_acc crosses acc_thresh
+        gaps            = []   # epoch_grok - epoch_memorize (only when both exist)
+        l2_finals       = []   # ||W||^2 at the end of training
+        final_test_accs = []
+        for trainer in seed_results.values():
+            h = trainer.history if hasattr(trainer, 'history') else trainer
+            em = first_epoch_above(h, 'train_acc', acc_thresh)
+            eg = first_epoch_above(h, 'test_acc',  acc_thresh)
+            if em is not None:
+                epochs_mem.append(em)
+            if eg is not None:
+                epochs_grok.append(eg)
+            if em is not None and eg is not None:
+                gaps.append(eg - em)
+            final_test_accs.append(h['test_acc'][-1])
+            l2_hist = h.get('l2_norm', [])
+            if l2_hist:
+                l2_finals.append(l2_hist[-1])
+
+        n_seeds = len(seed_results)
+        n_grok = len(epochs_grok)
+        ratio = n_grok / n_seeds if n_seeds else 0.0
+
+        row = {
+            **param_dict,
+            'n_grok':              n_grok,
+            'n_total':             n_seeds,
+            'did_grok_ratio':      ratio,
+            'did_grok_str':        f"{n_grok}/{n_seeds}",
+            'epoch_grok_median':   int(np.median(epochs_grok)) if epochs_grok else None,
+            'epoch_grok_min':      min(epochs_grok)             if epochs_grok else None,
+            'epoch_grok_max':      max(epochs_grok)             if epochs_grok else None,
+            'epoch_mem_median':    int(np.median(epochs_mem))   if epochs_mem else None,
+            'grok_gap_median':     int(np.median(gaps))         if gaps else None,
+            'l2_final_median':     round(float(np.median(l2_finals)), 1) if l2_finals else None,
+            'final_test_acc_med':  round(float(np.median(final_test_accs)), 4),
+        }
+        rows.append(row)
+
+    valid   = [r for r in rows if r['did_grok_ratio'] >= robustness_thresh]
+    invalid = [r for r in rows if r['did_grok_ratio'] <  robustness_thresh]
+
+    valid.sort(key=lambda r: (r['epoch_grok_median'] if r['epoch_grok_median'] is not None else 1e18))
+
+    return valid + invalid
+
+
+def print_grid_table(rows: list[dict], param_keys: list[str], top_n: Optional[int] = None) -> None:
+    """Pretty-print the output of aggregate_grid.
+
+    Shows: params + did_grok + memorization/grok epochs + gap + L2 final + final_acc.
+    """
+    if not rows:
+        print("(no rows)")
+        return
+    if top_n is not None:
+        rows = rows[:top_n]
+
+    display_keys = list(param_keys) + [
+        'did_grok_str',
+        'epoch_mem_median', 'epoch_grok_median', 'grok_gap_median',
+        'epoch_grok_min', 'epoch_grok_max',
+        'l2_final_median', 'final_test_acc_med',
+    ]
+    headers = {
+        **{k: k for k in param_keys},
+        'did_grok_str':       'did_grok',
+        'epoch_mem_median':   'mem_med',
+        'epoch_grok_median':  'eg_med',
+        'grok_gap_median':    'gap_med',
+        'epoch_grok_min':     'eg_min',
+        'epoch_grok_max':     'eg_max',
+        'l2_final_median':    'l2_final',
+        'final_test_acc_med': 'final_acc',
+    }
+    widths = {
+        k: max(len(headers[k]), max(len(str(r.get(k, ''))) for r in rows))
+        for k in display_keys
+    }
+    sep = ' | '
+    print(sep.join(headers[k].ljust(widths[k]) for k in display_keys))
+    print(sep.join('-' * widths[k] for k in display_keys))
+    for r in rows:
+        print(sep.join(str(r.get(k, '')).ljust(widths[k]) for k in display_keys))
 

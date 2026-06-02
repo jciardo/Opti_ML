@@ -1,6 +1,17 @@
+# Python cache folders automatically generated during execution
 __pycache__/
+
+# Compiled Python bytecode files
 *.pyc
+
+# macOS Finder metadata files
 .DS_Store
+
+# Jupyter Notebook automatic checkpoint folders
 .ipynb_checkpoints/
+
+# Python package metadata folders generated during local package installation/development
 *.egg-info/
+
+# PyTorch model/checkpoint files, often large and not meant to be pushed
 *.pt
