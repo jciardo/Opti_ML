@@ -12,4 +12,6 @@
 - 1. HuggingFace [post](https://huggingface.co/spaces/zboralski/grokking-introspection) on Grokking, used probes for regularization
 
 - 2. quick [read](https://www.quantamagazine.org/how-do-machines-grok-data-20240412/) on quanta magazine about grokking
+ 
+- 3. List of official [optimizers implementation](https://pytorch-optimizers.readthedocs.io/en/latest/)
 
