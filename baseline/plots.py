@@ -53,6 +53,82 @@ def plot_curves(history: dict, title: str = "Training run") -> None:
     fig.show()
 
 
+def plot_fourier_loss_comparison(
+    item,
+    title: str = "Nanda Fourier progress losses",
+    *,
+    excluded_key: str = "excluded_all_loss_train",
+    restricted_key: str = "restricted_loss_test",
+) -> None:
+    """Plot train/test loss against excluded and restricted Fourier losses.
+
+    Normal train/test losses are logged at `epoch`; Fourier losses are logged at
+    `fourier_epoch`, so the traces intentionally use different x arrays.
+    """
+    history = _get_history(item)
+    if not history.get("fourier_epoch"):
+        print("plot_fourier_loss_comparison: no Fourier snapshots found")
+        return
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            f"Train/test + {excluded_key}",
+            f"Train/test + {restricted_key}",
+        ),
+        horizontal_spacing=0.10,
+    )
+
+    base_traces = [
+        ("train_loss", "train loss", "#636EFA"),
+        ("test_loss", "test loss", "#EF553B"),
+    ]
+    for col in (1, 2):
+        for key, name, color in base_traces:
+            fig.add_trace(
+                go.Scatter(
+                    x=history["epoch"],
+                    y=history[key],
+                    mode="lines",
+                    name=name,
+                    line=dict(color=color),
+                    legendgroup=name,
+                    showlegend=(col == 1),
+                ),
+                row=1, col=col,
+            )
+
+    fig.add_trace(
+        go.Scatter(
+            x=history["fourier_epoch"],
+            y=history[excluded_key],
+            mode="lines+markers",
+            name=excluded_key,
+            line=dict(color="#00CC96", width=3),
+            legendgroup=excluded_key,
+        ),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=history["fourier_epoch"],
+            y=history[restricted_key],
+            mode="lines+markers",
+            name=restricted_key,
+            line=dict(color="#AB63FA", width=3),
+            legendgroup=restricted_key,
+        ),
+        row=1, col=2,
+    )
+
+    fig.update_xaxes(title_text="epoch", row=1, col=1)
+    fig.update_xaxes(title_text="epoch", row=1, col=2)
+    fig.update_yaxes(type="log", title_text="cross entropy", row=1, col=1)
+    fig.update_yaxes(type="log", title_text="cross entropy", row=1, col=2)
+    fig.update_layout(title=title, template="plotly_white", width=1100, height=430)
+    fig.show()
+
+
 # =============================================================================
 #  Learned modular addition table
 # =============================================================================

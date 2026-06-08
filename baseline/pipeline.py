@@ -262,6 +262,16 @@ class Trainer:
             'fourier_epoch': [], 'key_freqs': [],
             'restricted_loss': [], 'excluded_loss': [], 'excluded_loss_mean': [],
             'gini_W_E': [], 'gini_W_L': [],
+            'restricted_loss_all': [], 'restricted_acc_all': [],
+            'restricted_loss_train': [], 'restricted_acc_train': [],
+            'restricted_loss_test': [], 'restricted_acc_test': [],
+            'excluded_all_loss_all': [], 'excluded_all_acc_all': [],
+            'excluded_all_loss_train': [], 'excluded_all_acc_train': [],
+            'excluded_all_loss_test': [], 'excluded_all_acc_test': [],
+            'wl_top5_concentration': [], 'we_top5_concentration': [],
+            'wl_entropy': [], 'we_entropy': [],
+            'wl_frequency_masses': [], 'we_frequency_masses': [],
+            'cos_coefficients': [], 'key_cos_coefficients': [],
         }
 
     def __init__(
@@ -306,16 +316,16 @@ class Trainer:
         self.is_train = None
         self.is_test = None
         
-        # if fourier_every is not None:
-        #     try:
-        #         from helpers import fourier_metrics, get_train_test_masks
-        #         is_train, is_test = get_train_test_masks(train_pairs, test_pairs, config.p)
-        #         self.is_train = is_train.to(device)
-        #         self.is_test  = is_test.to(device)
-        #         self._fourier_metrics = fourier_metrics
-        #         self.fourier_ready = True
-        #     except Exception as ex:
-        #         print(f"[Trainer '{label}'] Fourier metrics disabled: {ex}")
+        if fourier_every is not None:
+            try:
+                from fourier_metrics import fourier_metrics, get_train_test_masks
+                self.is_train, self.is_test = get_train_test_masks(
+                    train_pairs, test_pairs, config.p, device=device
+                )
+                self._fourier_metrics = fourier_metrics
+                self.fourier_ready = True
+            except Exception as ex:
+                print(f"[Trainer '{label}'] Fourier metrics disabled: {ex}")
         # ====================================================
     
     
@@ -523,9 +533,8 @@ class Trainer:
             self.history['fourier_epoch'].append(self.epoch)
             # NOTE: 'l2_norm' is no longer logged here — it's tracked at every
             # eval_every step in _take_eval_snapshot (cheaper + finer granularity).
-            for k in ('key_freqs', 'restricted_loss', 'excluded_loss',
-                      'excluded_loss_mean', 'gini_W_E', 'gini_W_L'):
-                self.history[k].append(fm[k])
+            for k, v in fm.items():
+                self.history.setdefault(k, []).append(v)
             self._dispatch('on_fourier_snapshot')
         except Exception as ex:
             if self.epoch == 0:
@@ -825,6 +834,7 @@ def grid_search(
                             existing[seed] = Trainer.from_run(
                                 os.path.join(combo_folder, d),
                                 specs=specs_for_reload,
+                                fourier_every=trainer_kwargs.get('fourier_every'),
                             )
                         except Exception as ex:
                             print(f"   ⚠ could not reload seed{seed}: {ex}")
@@ -950,4 +960,3 @@ def print_grid_table(rows: list[dict], param_keys: list[str], top_n: Optional[in
     print(sep.join('-' * widths[k] for k in display_keys))
     for r in rows:
         print(sep.join(str(r.get(k, '')).ljust(widths[k]) for k in display_keys))
-
