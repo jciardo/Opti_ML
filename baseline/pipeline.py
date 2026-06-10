@@ -4,7 +4,8 @@ from typing import Callable, Optional
 import torch as t
 import torch.nn as nn
 from optimizer.muon import SingleDeviceMuon as Muon  # single-GPU variant of Keller Jordan's Muon
-from optimizer.soap import SOAP                       
+from optimizer.soap import SOAP
+from optimizer.egd  import EGD                        # PyTorch port of Pasand & Dohmatob (ICLR 2026)
 
 
 ParamFilter = Callable[[str, t.Tensor], bool] 
@@ -19,7 +20,7 @@ class OptimizerSpec:
     Fields
     ------
     name : str
-        Identifier of the algorithm. Currently supported: 'adamw', 'muon', 'sgd', 'soap'.
+        Identifier of the algorithm. Currently supported: 'adamw', 'muon', 'sgd', 'soap', 'egd'.
         Adding a new optimizer = adding one entry in `_OPTIMIZER_REGISTRY`.
 
     lr : float
@@ -77,12 +78,16 @@ def _register_default_optimizers():
     def _build_soap(params, lr, weight_decay, **extra):
         return SOAP(params, lr=lr, weight_decay=weight_decay, **extra)
 
+    def _build_egd(params, lr, weight_decay, **extra):
+        return EGD(params, lr=lr, weight_decay=weight_decay, **extra)
+
     #! add new optimizers here !!
 
     _OPTIMIZER_REGISTRY['adamw'] = _build_adamw
     _OPTIMIZER_REGISTRY['muon']  = _build_muon
     _OPTIMIZER_REGISTRY['sgd']   = _build_sgd
     _OPTIMIZER_REGISTRY['soap']  = _build_soap
+    _OPTIMIZER_REGISTRY['egd']   = _build_egd
 
 
 _register_default_optimizers()
@@ -283,6 +288,7 @@ class Trainer:
         *, #! force keyword arguments after this point for clarity in calls to Trainer()
         eval_every: int = 50,
         fourier_every: Optional[int] = None,   # None to disable Fourier metrics
+        fixed_key_freqs: Optional[list] = None, # if set, fourier_metrics uses these freqs (else adaptive per snapshot)
         warmup_steps: int = 10,
         verbose_every: int = 5000,
         verbose_build: bool = False,
@@ -294,6 +300,7 @@ class Trainer:
         self.label = label
         self.eval_every = eval_every
         self.fourier_every = fourier_every
+        self.fixed_key_freqs = fixed_key_freqs
         self.warmup_steps = warmup_steps
         self.verbose_every = verbose_every
 
@@ -526,9 +533,13 @@ class Trainer:
     def _take_fourier_snapshot(self):
         self.model.eval()
         try:
+            fm_kwargs = {}
+            if self.fixed_key_freqs is not None:
+                fm_kwargs['key_freqs'] = self.fixed_key_freqs
             fm = self._fourier_metrics(
                 self.model, self.config, self.all_data,
                 self.is_train, self.is_test,
+                **fm_kwargs,
             )
             self.history['fourier_epoch'].append(self.epoch)
             # NOTE: 'l2_norm' is no longer logged here — it's tracked at every
@@ -684,10 +695,21 @@ def run_multi_seed(
             label=f"{label_prefix}_seed{seed}",
             **trainer_kwargs,
         )
-        trainer.fit()
+        diverged = False
+        try:
+            trainer.fit()
+        except RuntimeError as e:
+            msg = str(e)
+            if 'EGD' in msg or 'non-finite' in msg.lower() or 'diverged' in msg.lower():
+                print(f"  ⚠ seed {seed} DIVERGED at epoch {trainer.epoch}: {msg}")
+                diverged = True
+            else:
+                raise
         if save_root is not None:
+            if diverged and isinstance(trainer.history, dict):
+                trainer.history['diverged'] = True
             trainer.save_run(f"{save_root}/seed{seed}")
-            print(f"  saved to {save_root}/seed{seed}/")
+            print(f"  saved to {save_root}/seed{seed}/{' [DIVERGED]' if diverged else ''}")
         results[seed] = trainer
     return results
 

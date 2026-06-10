@@ -1,0 +1,44 @@
+{
+  "label": "lr_egd0.01__wd_egd0.1__momentum_egd0.9_seed1",
+  "seed": 1,
+  "epoch": 15000,
+  "saved_at": "2026-06-06T17:33:21",
+  "config": {
+    "p": 113,
+    "frac_train": 0.3,
+    "seed": 0,
+    "d_model": 128,
+    "d_mlp": 512,
+    "num_heads": 4,
+    "num_layers": 1,
+    "n_ctx": 3,
+    "d_vocab": 114,
+    "act_type": "ReLU",
+    "use_ln": false,
+    "num_epochs": 15000
+  },
+  "specs": [
+    {
+      "name": "egd",
+      "lr": 0.01,
+      "weight_decay": 0.1,
+      "extra": {
+        "momentum": 0.9,
+        "mode": "svd"
+      },
+      "has_param_filter": true
+    },
+    {
+      "name": "adamw",
+      "lr": 0.001,
+      "weight_decay": 1.0,
+      "extra": {
+        "betas": [
+          0.9,
+          0.98
+        ]
+      },
+      "has_param_filter": false
+    }
+  ]
+}

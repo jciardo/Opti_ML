@@ -1,0 +1,43 @@
+{
+  "label": "lr_muon0.3__wd_muon0_seed0",
+  "seed": 0,
+  "epoch": 25000,
+  "saved_at": "2026-06-08T21:55:36",
+  "config": {
+    "p": 113,
+    "frac_train": 0.3,
+    "seed": 0,
+    "d_model": 128,
+    "d_mlp": 512,
+    "num_heads": 4,
+    "num_layers": 1,
+    "n_ctx": 3,
+    "d_vocab": 114,
+    "act_type": "ReLU",
+    "use_ln": false,
+    "num_epochs": 25000
+  },
+  "specs": [
+    {
+      "name": "muon",
+      "lr": 0.3,
+      "weight_decay": 0,
+      "extra": {
+        "momentum": 0.95
+      },
+      "has_param_filter": true
+    },
+    {
+      "name": "adamw",
+      "lr": 0.001,
+      "weight_decay": 1.0,
+      "extra": {
+        "betas": [
+          0.9,
+          0.98
+        ]
+      },
+      "has_param_filter": false
+    }
+  ]
+}
