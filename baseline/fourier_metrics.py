@@ -330,4 +330,15 @@ def fourier_metrics(
         "key_cos_coefficients": coefficients[[k - 1 for k in key_freqs]].detach().cpu().tolist()
             if key_freqs else [],
     })
+
+    # Concentration spectrale dans les key_freqs FIXES (uniquement si key_freqs fournis).
+    # Mesure : fraction de la masse spectrale concentrée dans les freqs identifiées en Phase 1.
+    if key_freqs:
+        key_idx = [k - 1 for k in key_freqs if 1 <= k <= len(wl_masses)]
+        if key_idx:
+            wl_total = wl_masses.sum()
+            we_total = we_masses.sum()
+            out["wl_keyfreq_concentration"] = float(wl_masses[key_idx].sum() / wl_total) if wl_total > 0 else 0.0
+            out["we_keyfreq_concentration"] = float(we_masses[key_idx].sum() / we_total) if we_total > 0 else 0.0
+
     return out

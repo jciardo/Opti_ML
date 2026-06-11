@@ -101,6 +101,12 @@ class Config:
 
     num_epochs: int = 40_000
 
+    # Once test_acc reaches `adaptive_logging_thresh`, multiply eval_every and fourier_every
+    # by `adaptive_logging_factor` to reduce storage in post-grok regime.
+    adaptive_logging:         bool  = False
+    adaptive_logging_thresh:  float = 0.99
+    adaptive_logging_factor:  int   = 10
+
     device: t.device = (
         t.device("cuda") if t.cuda.is_available()
         else t.device("mps") if t.backends.mps.is_available()

@@ -1,0 +1,37 @@
+{
+  "label": "adamw_fast_p2_seed2",
+  "seed": 2,
+  "epoch": 25000,
+  "saved_at": "2026-06-10T16:25:42",
+  "config": {
+    "p": 113,
+    "frac_train": 0.3,
+    "seed": 0,
+    "d_model": 128,
+    "d_mlp": 512,
+    "num_heads": 4,
+    "num_layers": 1,
+    "n_ctx": 3,
+    "d_vocab": 114,
+    "act_type": "ReLU",
+    "use_ln": false,
+    "num_epochs": 25000,
+    "adaptive_logging": true,
+    "adaptive_logging_thresh": 0.99,
+    "adaptive_logging_factor": 5
+  },
+  "specs": [
+    {
+      "name": "adamw",
+      "lr": 0.01,
+      "weight_decay": 1.0,
+      "extra": {
+        "betas": [
+          0.9,
+          0.98
+        ]
+      },
+      "has_param_filter": false
+    }
+  ]
+}

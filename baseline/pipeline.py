@@ -452,10 +452,29 @@ class Trainer:
         n_epochs = num_epochs if num_epochs is not None else self.config.num_epochs
         start_epoch = self.epoch
 
+        # ── Adaptive logging state ─────────────────────────────────────────────
+        # If config.adaptive_logging is True, eval_every and fourier_every are multiplied
+        # by config.adaptive_logging_factor once test_acc crosses config.adaptive_logging_thresh.
+        adaptive       = getattr(self.config, 'adaptive_logging', False)
+        adaptive_thresh = getattr(self.config, 'adaptive_logging_thresh', 0.99)
+        adaptive_factor = getattr(self.config, 'adaptive_logging_factor', 10)
+        self._adaptive_switched = False
+
         for self.epoch in range(start_epoch, n_epochs + 1):
             # Eval snapshot
             if self.epoch % self.eval_every == 0:
                 self._take_eval_snapshot() #! definition below
+
+                # ── Adaptive switch : check after each eval snapshot ──────────
+                if (adaptive and not self._adaptive_switched
+                        and self.history.get('test_acc')
+                        and self.history['test_acc'][-1] >= adaptive_thresh):
+                    self.eval_every = int(self.eval_every * adaptive_factor)
+                    if self.fourier_every is not None:
+                        self.fourier_every = int(self.fourier_every * adaptive_factor)
+                    self._adaptive_switched = True
+                    print(f'  [{self.label}] adaptive_logging : grok at epoch {self.epoch}, '
+                          f'switching to eval_every={self.eval_every}, fourier_every={self.fourier_every}')
 
             # Fourier snapshot
             if self.fourier_ready and self.epoch % self.fourier_every == 0:
