@@ -3,48 +3,55 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 import torch as t
 import torch.nn as nn
-from optimizer.muon import SingleDeviceMuon as Muon  # single-GPU variant of Keller Jordan's Muon
+
+# Keller Jordan's Muon — single-device variant.
+# https://github.com/KellerJordan/Muon
+from optimizer.muon import SingleDeviceMuon as Muon
+
+# Vyas et al., "SOAP: Improving and Stabilizing Shampoo using Adam".
+# https://github.com/nikhilvyas/SOAP — https://arxiv.org/abs/2409.11321
 from optimizer.soap import SOAP
-from optimizer.egd  import EGD                        # PyTorch port of Pasand & Dohmatob (ICLR 2026)
+
+# PyTorch port of Pasand & Dohmatob (ICLR 2026), "Egalitarian Gradient Descent".
+# https://github.com/asahebpa/Egalitarian-Gradient-Descent — https://arxiv.org/abs/2510.04930
+from optimizer.egd import EGD
 
 
-ParamFilter = Callable[[str, t.Tensor], bool] 
-
+ParamFilter = Callable[[str, t.Tensor], bool]
 
 
 @dataclass(frozen=True)
 class OptimizerSpec:
-    """
-    description of one optimizer applied to a subset of model parameters.
+    """One optimizer applied to a subset of model parameters.
 
     Fields
     ------
     name : str
-        Identifier of the algorithm. Currently supported: 'adamw', 'muon', 'sgd', 'soap', 'egd'.
-        Adding a new optimizer = adding one entry in `_OPTIMIZER_REGISTRY`.
+        Algorithm identifier. Supported: 'adamw', 'muon', 'sgd', 'soap', 'egd'.
+        Adding a new optimizer = one entry in `_OPTIMIZER_REGISTRY`.
 
     lr : float
         Learning rate.
 
     weight_decay : float, default 0.0
-        Decoupled weight decay coefficient (AdamW-style for both AdamW and Muon).
+        Decoupled weight decay (AdamW-style for both AdamW and Muon).
 
-    #! param_filter : Optional[Callable[(name, tensor), bool]], default None
-        predicate selecting which parameters this spec governs.
-        If None, this spec acts as a *catch-all*: it captures every parameter
-        not already claimed by an earlier spec.
-        If multiple specs match a parameter, the FIRST spec in the list wins.
+    param_filter : Optional[Callable[(name, tensor), bool]], default None
+        Predicate selecting which parameters this spec governs.
+        If None, this spec is a catch-all: captures every parameter not already
+        claimed by an earlier spec. If multiple specs match a parameter, the
+        FIRST spec in the list wins.
 
     extra : dict
         Algorithm-specific hyperparameters (e.g. {'betas': (0.9, 0.98)} for AdamW,
         {'momentum': 0.95, 'nesterov': True, 'ns_steps': 5} for Muon).
-
     """
     name: str
     lr: float
     weight_decay: float = 0.0
     param_filter: Optional[ParamFilter] = None
-    extra: dict = field(default_factory=dict)  #! ensure default is a new dict for each instance
+    # default_factory so each instance gets a fresh dict.
+    extra: dict = field(default_factory=dict)
 
     def describe(self) -> str:
         """Short human-readable summary for logs."""
@@ -57,10 +64,8 @@ class OptimizerSpec:
 
 
 
-# Contains all the optimizers we will use 
-#! ==> to be completed with soap etc... !!
 _OPTIMIZER_REGISTRY: dict[str, Callable] = {}
-#! On pourrait mettre une fonction pour ajouter optimiser depuis API mais autant tout faire direct ici... 
+
 
 def _register_default_optimizers():
     """Populate the registry with the optimizers supported out of the box."""
@@ -70,7 +75,7 @@ def _register_default_optimizers():
         return optim.AdamW(params, lr=lr, weight_decay=weight_decay, **extra)
 
     def _build_muon(params, lr, weight_decay, **extra):
-        return Muon(params, lr=lr, weight_decay=weight_decay, **extra)  
+        return Muon(params, lr=lr, weight_decay=weight_decay, **extra)
 
     def _build_sgd(params, lr, weight_decay, **extra):
         return optim.SGD(params, lr=lr, weight_decay=weight_decay, **extra)
@@ -80,8 +85,6 @@ def _register_default_optimizers():
 
     def _build_egd(params, lr, weight_decay, **extra):
         return EGD(params, lr=lr, weight_decay=weight_decay, **extra)
-
-    #! add new optimizers here !!
 
     _OPTIMIZER_REGISTRY['adamw'] = _build_adamw
     _OPTIMIZER_REGISTRY['muon']  = _build_muon
@@ -153,7 +156,7 @@ def build_optimizers(
     for spec, params, names in zip(specs, groups, group_names):
         if not params:
             if verbose:
-                print(f"  ! {spec.describe()} captured 0 params -> skipped")
+                print(f"  ! {spec.describe()} captured 0 params --> skipped")
             continue
         if spec.name not in _OPTIMIZER_REGISTRY:
             raise ValueError(
@@ -174,37 +177,16 @@ def build_optimizers(
 
 
 
-_MODEL_BACKEND: str = 'vanilla' #! tl pour le model de jean avec les hooks
-
-
-def set_model_backend(backend: str) -> None:
-    """Switch the model implementation used by the pipeline.
-    """
-    global _MODEL_BACKEND # to ensure we modify the global variable 
-    if backend not in {'vanilla', 'tl'}:
-        raise ValueError(f"Unknown backend: {backend!r}. Use 'vanilla' or 'tl'.")
-    _MODEL_BACKEND = backend
-
-
 def build_model(config) -> nn.Module:
-    """Instantiate the transformer used by the pipeline.
-    """
-    if _MODEL_BACKEND == 'vanilla':
-        from model import Transformer  # local import keeps top-level cheap
-        return Transformer(config, use_cache=False)
-
-    if _MODEL_BACKEND == 'tl':
-        #! model avec les hookers, mais en vrai faudra tej distinction entre les deux c'est juste au cas ou ca demande des traitements très différent
-        raise NotImplementedError(
-            "Model avec Hook encore sur la planche !!! Avanti le J"
-        )
-    raise RuntimeError(f"Unreachable: backend={_MODEL_BACKEND!r}")
+    """Instantiate the transformer used by the pipeline."""
+    from model import Transformer  # local import keeps top-level cheap
+    return Transformer(config)
 
 
 def cross_entropy_high_precision(logits: t.Tensor, labels: t.Tensor) -> t.Tensor:
-    """Cross-entropy loss in float64 (float32 on MPS) for stability at low loss.
-    """
-    target_dtype = t.float32 if logits.device.type == 'mps' else t.float64 #! est ce que on va devoir tout run sur cuda !! :(
+    """Cross-entropy loss in float64 (float32 on MPS) for stability at low loss."""
+    # MPS backend does not support float64; CUDA/CPU do.
+    target_dtype = t.float32 if logits.device.type == 'mps' else t.float64
     logprobs = t.nn.functional.log_softmax(logits.to(target_dtype), dim=-1)
     prediction_logprobs = t.gather(logprobs, index=labels[:, None], dim=-1)
     return -t.mean(prediction_logprobs)
@@ -230,7 +212,7 @@ class Trainer:
     @staticmethod
     def _seed_everything(seed: int) -> None:
         """Set Python / NumPy / torch RNG seeds (CPU + CUDA)."""
-        import random as random
+        import random
         import numpy as np
         random.seed(seed)
         np.random.seed(seed)
@@ -247,23 +229,17 @@ class Trainer:
     def _empty_history(label: str, specs: list[OptimizerSpec], seed: int) -> dict:
         """Initialize the history dict with all the keys we may populate."""
         return {
-            # Metadata (for joining results later)
             'label': label,
             'seed': seed,
             'specs_repr': [s.describe() for s in specs],
-            # Fast eval (every `eval_every` epochs)
             'epoch': [], 'train_loss': [], 'test_loss': [],
             'train_acc': [], 'test_acc': [],
-            'l2_norm': [],   # sum_i ||W_i||^2 — cheap, tracked at eval frequency
-            # L2 decomposed by module group (Nanda cleanup analysis)
+            'l2_norm': [],  
             'l2_embed': [], 'l2_attn': [], 'l2_mlp': [], 'l2_unembed': [],
-            # Optimizer dynamics (captured on the step immediately before each eval)
-            'grad_norm': [],            # ||grad|| of the last step
-            'update_norm': [],          # ||theta_{t+1} - theta_t|| over all params
-            'update_norm_per_opt': [],  # same, decomposed per optimizer
-            # Wall-clock seconds since the previous eval (epoch=0 entry: since init)
+            'grad_norm': [],            
+            'update_norm': [],         
+            'update_norm_per_opt': [], 
             'eval_wallclock': [],
-            # Fourier progress measures (every `fourier_every` epochs)
             'fourier_epoch': [], 'key_freqs': [],
             'restricted_loss': [], 'excluded_loss': [], 'excluded_loss_mean': [],
             'gini_W_E': [], 'gini_W_L': [],
@@ -285,10 +261,10 @@ class Trainer:
         specs: list[OptimizerSpec],
         seed: int = 0,
         label: str = 'run',
-        *, #! force keyword arguments after this point for clarity in calls to Trainer()
+        *,
         eval_every: int = 50,
-        fourier_every: Optional[int] = None,   # None to disable Fourier metrics
-        fixed_key_freqs: Optional[list] = None, # if set, fourier_metrics uses these freqs (else adaptive per snapshot)
+        fourier_every: Optional[int] = None,
+        fixed_key_freqs: Optional[list] = None,
         warmup_steps: int = 10,
         verbose_every: int = 5000,
         verbose_build: bool = False,
@@ -317,13 +293,12 @@ class Trainer:
             dtype=t.long, device=device,
         )
  
-        # ============== FOURIER METRICS SETUP ==============
         self.fourier_ready = False
         self._fourier_metrics = None
         self.is_train = None
         self.is_test = None
-        
-        if fourier_every is not None:
+
+        if fourier_every is not None:    
             try:
                 from fourier_metrics import fourier_metrics, get_train_test_masks
                 self.is_train, self.is_test = get_train_test_masks(
@@ -333,9 +308,7 @@ class Trainer:
                 self.fourier_ready = True
             except Exception as ex:
                 print(f"[Trainer '{label}'] Fourier metrics disabled: {ex}")
-        # ====================================================
-    
-    
+
         self.model = build_model(config).to(device)
         if verbose_build:
             print(f"\n=== Trainer '{label}' (seed={seed}) ===")
@@ -343,7 +316,6 @@ class Trainer:
                 print(f"  spec: {s.describe()}")
         self.optimizers = build_optimizers(self.model, specs, verbose=verbose_build)
 
-        #! reprends la meme que celle dans baseline.iynb !!
         warmup_fn = lambda step: min(step / max(1, warmup_steps), 1.0)
         self.schedulers = [
             t.optim.lr_scheduler.LambdaLR(opt, warmup_fn) for opt in self.optimizers
@@ -352,41 +324,28 @@ class Trainer:
         # --- Mutable training state ---
         self.epoch: int = 0
         self.history: dict = Trainer._empty_history(label=label, specs=specs, seed=seed)
-        self._callbacks: dict[str, list[Callable]] = { #! vide pour l'instant, à remplir avec les fonctions qu'on veut appeler à chaque étape de la boucle d'entrainement
-            'on_eval': [],
-            'on_fourier_snapshot': [],
-            'on_epoch_end': [],
-        }
 
-        # --- Optimizer diagnostics setup ---
-        # Map each parameter (by id) to which optimizer owns it, so update_norm
-        # can be decomposed per-optimizer for hybrid setups (Muon + AdamW).
+        # Map each parameter id to its owning optimizer, so update_norm can be
+        # decomposed per-optimizer for hybrid setups (Muon + AdamW).
         self._opt_param_id_sets: list[set] = [
             {id(p) for group in opt.param_groups for p in group['params']}
             for opt in self.optimizers
         ]
-        # Buffers populated in step() (only on steps just before an eval), read
-        # in _take_eval_snapshot. None at epoch=0 (no step has happened yet).
+        # Populated in step() on steps just before an eval; read in
+        # _take_eval_snapshot. None at epoch=0 (no step has happened yet).
         self._last_grad_norm: Optional[float] = None
         self._last_update_norm: Optional[float] = None
         self._last_update_norm_per_opt: Optional[list[float]] = None
-        # Wall-clock anchor for the next eval delta.
         import time as _time
         self._last_eval_walltime: float = _time.perf_counter()
 
     def step(self) -> float:
-        """One training step (forward + backward + optimizer step + scheduler step).
+        """Forward + backward + optimizer step + scheduler step.
 
-        On the step whose result will be evaluated next (i.e. (epoch+1) % eval_every == 0),
-        also captures ||grad|| and ||update|| (total and per-optimizer) into
-        self._last_*; these are consumed by the next _take_eval_snapshot.
         """
         self.model.train()
-
-        # Decide whether to capture diagnostics this step (only ~1 step in eval_every).
         capture_diag = ((self.epoch + 1) % self.eval_every == 0)
         if capture_diag:
-            # Clone before the update so we can compute ||theta_after - theta_before||.
             params_before = [p.detach().clone() for p in self.model.parameters()]
 
         logits = self.model(self.train_data)[:, -1, :self.config.p]
@@ -395,7 +354,6 @@ class Trainer:
         loss.backward()
 
         if capture_diag:
-            # ||grad|| over all params (post-backward, pre-step).
             gn_sq_t = t.zeros((), device=self.device)
             for p in self.model.parameters():
                 if p.grad is not None:
@@ -408,7 +366,6 @@ class Trainer:
             sch.step()
 
         if capture_diag:
-            # ||update|| total + decomposed per optimizer.
             n_opt = len(self.optimizers)
             un_per_opt_t = [t.zeros((), device=self.device) for _ in range(n_opt)]
             total_sq_t   = t.zeros((), device=self.device)
@@ -439,33 +396,22 @@ class Trainer:
         acc = (logits.argmax(dim=-1) == labels).float().mean()
         return loss.item(), acc.item()
 
-    def fit(self, num_epochs: Optional[int] = None) -> dict: #! One single Training loop with eval and fourier (to do) callbacks
+    def fit(self, num_epochs: Optional[int] = None) -> dict:
         """Run the full training loop.
 
-        Resumes from `self.epoch` if called more than once, so you can:
-            trainer.fit(num_epochs=5000)    # phase 1
-            # ... inspect trainer.model ...
-            trainer.fit(num_epochs=40000)   # continue to 40000
-
-        Returns the (still-mutable) `history` dict.
+        Resumes from `self.epoch` if called more than once
         """
         n_epochs = num_epochs if num_epochs is not None else self.config.num_epochs
         start_epoch = self.epoch
-
-        # ── Adaptive logging state ─────────────────────────────────────────────
-        # If config.adaptive_logging is True, eval_every and fourier_every are multiplied
-        # by config.adaptive_logging_factor once test_acc crosses config.adaptive_logging_thresh.
-        adaptive       = getattr(self.config, 'adaptive_logging', False)
+        adaptive        = getattr(self.config, 'adaptive_logging', False)
         adaptive_thresh = getattr(self.config, 'adaptive_logging_thresh', 0.99)
         adaptive_factor = getattr(self.config, 'adaptive_logging_factor', 10)
         self._adaptive_switched = False
 
         for self.epoch in range(start_epoch, n_epochs + 1):
-            # Eval snapshot
             if self.epoch % self.eval_every == 0:
-                self._take_eval_snapshot() #! definition below
+                self._take_eval_snapshot()
 
-                # ── Adaptive switch : check after each eval snapshot ──────────
                 if (adaptive and not self._adaptive_switched
                         and self.history.get('test_acc')
                         and self.history['test_acc'][-1] >= adaptive_thresh):
@@ -476,32 +422,15 @@ class Trainer:
                     print(f'  [{self.label}] adaptive_logging : grok at epoch {self.epoch}, '
                           f'switching to eval_every={self.eval_every}, fourier_every={self.fourier_every}')
 
-            # Fourier snapshot
             if self.fourier_ready and self.epoch % self.fourier_every == 0:
-                self._take_fourier_snapshot() #! definition below
+                self._take_fourier_snapshot()
 
             if self.epoch == n_epochs:
                 break
 
             self.step()
-            self._dispatch('on_epoch_end')
 
         return self.history
-
-    def register_callback(self, event: str, fn: Callable): #! fait parti de l'API publique donc on pourra ajouer ce que on veut ici
-        """Register a callback for one of the lifecycle events.
-        Valid events: 'on_eval', 'on_fourier_snapshot', 'on_epoch_end'.
-        """
-        if event not in self._callbacks:
-            raise ValueError(
-                f"Unknown event '{event}'. Valid: {list(self._callbacks)}"
-            )
-        self._callbacks[event].append(fn)
-
-    def _dispatch(self, event: str):
-        """Call all callbacks registered to `event`. Each receives `self`."""
-        for cb in self._callbacks[event]:
-            cb(self)
 
     def _take_eval_snapshot(self):
         import time as _time
@@ -515,7 +444,7 @@ class Trainer:
             sq = p.detach().pow(2).sum().item()
             if 'unembed' in name:
                 l2_unembed += sq
-            elif 'embed' in name:                 # covers W_E and W_pos
+            elif 'embed' in name:                 #
                 l2_embed += sq
             elif 'attn' in name:
                 l2_attn += sq
@@ -533,13 +462,9 @@ class Trainer:
         self.history['l2_attn'].append(l2_attn)
         self.history['l2_mlp'].append(l2_mlp)
         self.history['l2_unembed'].append(l2_unembed)
-
-        # Optimizer diagnostics captured in step() (None at epoch=0).
         self.history['grad_norm'].append(self._last_grad_norm)
         self.history['update_norm'].append(self._last_update_norm)
         self.history['update_norm_per_opt'].append(self._last_update_norm_per_opt)
-
-        # Wall-clock seconds elapsed since the previous eval.
         now = _time.perf_counter()
         self.history['eval_wallclock'].append(now - self._last_eval_walltime)
         self._last_eval_walltime = now
@@ -547,7 +472,6 @@ class Trainer:
         if self.verbose_every and self.epoch % self.verbose_every == 0:
             print(f"  [{self.label} seed={self.seed}] epoch {self.epoch:5d} "
                   f"| train acc {tr_a:.3f} | test acc {te_a:.3f}")
-        self._dispatch('on_eval')
 
     def _take_fourier_snapshot(self):
         self.model.eval()
@@ -561,11 +485,8 @@ class Trainer:
                 **fm_kwargs,
             )
             self.history['fourier_epoch'].append(self.epoch)
-            # NOTE: 'l2_norm' is no longer logged here — it's tracked at every
-            # eval_every step in _take_eval_snapshot (cheaper + finer granularity).
             for k, v in fm.items():
                 self.history.setdefault(k, []).append(v)
-            self._dispatch('on_fourier_snapshot')
         except Exception as ex:
             if self.epoch == 0:
                 print(f"  [{self.label}] Fourier metrics raised at epoch 0: {ex}")
@@ -580,8 +501,6 @@ class Trainer:
         from datetime import datetime
 
         os.makedirs(folder, exist_ok=True)
-
-        # --- meta.json (config + specs + metadata) ---
         cfg_dict = dataclasses.asdict(self.config)
         cfg_dict.pop('device', None)  # device is re-detected at load time
 
@@ -654,7 +573,6 @@ class Trainer:
                 for s in spec_dicts
             ]
 
-        # --- Build trainer with same setup ---
         trainer = cls(
             config, specs,
             seed=int(meta['seed']),
@@ -662,15 +580,11 @@ class Trainer:
             fourier_every=fourier_every,
             verbose_build=False,
         )
-
-        # --- Restore model + epoch + history ---
         trainer.model.load_state_dict(
             t.load(os.path.join(folder, 'model.pt'), map_location=config.device)
         )
         trainer.epoch = int(meta['epoch'])
         trainer.history = history
-
-        # --- Restore optimizers + schedulers if present ---
         optim_path = os.path.join(folder, 'optim.pt')
         if os.path.exists(optim_path):
             opt_ckpt = t.load(optim_path, map_location=config.device)
@@ -790,23 +704,6 @@ def grid_search(
         Function that takes named kwargs (matching `param_grid` keys) and
         returns a list of OptimizerSpec. This is the modular extension point:
         you can build any spec configuration from any set of hyperparameters.
-
-        Example for AdamW:
-            def make_adamw(lr, weight_decay):
-                return [OptimizerSpec('adamw', lr=lr, weight_decay=weight_decay,
-                                       extra={'betas': (0.9, 0.98)})]
-
-        Example for Muon hybrid:
-            def make_muon_hybrid(lr_muon, wd_muon):
-                return [
-                    OptimizerSpec('muon', lr=lr_muon, weight_decay=wd_muon,
-                                  param_filter=lambda n, p: p.ndim >= 2
-                                                            and 'embed' not in n,
-                                  extra={'momentum': 0.95}),
-                    OptimizerSpec('adamw', lr=1e-3, weight_decay=1.0,
-                                  extra={'betas': (0.9, 0.98)}),
-                ]
-
     param_grid : dict[str, list]
         Maps parameter name to list of values. Cartesian product is iterated.
         Example: {'lr': [1e-3, 5e-3], 'weight_decay': [0.3, 1.0]}
@@ -831,11 +728,6 @@ def grid_search(
     dict[tuple, dict[int, Trainer]]
         {combo_tuple: {seed: trainer}}. Use `aggregate_grid` to analyse.
 
-    Notes
-    -----
-    Resume: if a seed folder already exists, it is reloaded via Trainer.from_run
-    (with the same `spec_builder` to handle param_filter lambdas). Only missing
-    seeds are actually trained.
     """
     import os
     import itertools
@@ -878,7 +770,7 @@ def grid_search(
                                 fourier_every=trainer_kwargs.get('fourier_every'),
                             )
                         except Exception as ex:
-                            print(f"   ⚠ could not reload seed{seed}: {ex}")
+                            print(f" !!could not reload seed{seed}: {ex}")
 
         missing = [s for s in seeds if s not in existing]
         if existing:
@@ -916,10 +808,10 @@ def aggregate_grid(
     rows = []
     for combo, seed_results in grid_results.items():
         param_dict = dict(zip(param_keys, combo))
-        epochs_mem      = []   # epoch where train_acc crosses acc_thresh
-        epochs_grok     = []   # epoch where test_acc crosses acc_thresh
-        gaps            = []   # epoch_grok - epoch_memorize (only when both exist)
-        l2_finals       = []   # ||W||^2 at the end of training
+        epochs_mem      = []  
+        epochs_grok     = []   
+        gaps            = []   
+        l2_finals       = []  
         final_test_accs = []
         for trainer in seed_results.values():
             h = trainer.history if hasattr(trainer, 'history') else trainer

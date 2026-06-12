@@ -1,35 +1,14 @@
-"""
-viz_analysis.py
-================
 
-Helper module for multi-seed grokking analysis.
-
-Functions :
-    - load_seeds                : load history.json from each seed's dir
-    - stack / stack_fourier     : stack a metric across seeds
-    - epoch_mean_crosses        : mean-curve threshold crossing (visually aligned with bold mean)
-    - compute_grokking_markers  : returns mem, circuit, grok dict (mean-curve crossings)
-    - per_seed_stats            : per-seed grok stats (median, IQR, range)
-
-Plot functions (all matplotlib, multi-seed band style) :
-    - plot_curves_band          : 3 rows × 2 cols (loss / acc / L2, lin + log)
-    - plot_fourier_losses_band  : 2 panels (train/test + excluded, + restricted)
-    - plot_freq_mass_heatmap    : heatmap (epoch × freq) for W_L et W_E
-    - plot_sparsity             : 6 panels (top5_conc, entropy, gini for WL and WE)
-    - plot_fourier_components   : Nanda-style bar chart (W_E + W_U)
-    - identify_key_freqs        : extract consensus key freqs from bar chart data
-"""
 
 from __future__ import annotations
 import json
 from pathlib import Path
 from collections import Counter
-
 import numpy as np
+import pandas as pd
 import torch as t
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-
 
 # =============================================================================
 # Constants
@@ -50,11 +29,6 @@ def _first_above(epochs, vals, thresh):
 
 def load_seeds(save_root, seeds, *, acc_thresh: float = 0.99):
     """Load seedN/history.json for each seed.
-
-    Returns
-    -------
-    runs : list of {'seed', 'history', 'mem', 'grok'}
-    runs_dict : {seed: history_dict}  — for compatibility with plot_seeds_band etc.
     """
     save_root = Path(save_root)
     runs, runs_dict = [], {}
@@ -110,42 +84,6 @@ def stack(runs, key):           return _stack_curve(runs, key, time_key='epoch')
 def stack_fourier(runs, key):   return _stack_curve(runs, key, time_key='fourier_epoch')
 
 
-def _stack_freq_matrix(runs, key='wl_frequency_masses'):
-    """Stack per-seed (n_snapshots × n_freqs) Fourier matrices on a common epoch grid
-    via interpolation. Returns (epochs, mean_matrix) where mean_matrix has shape
-    (n_epochs_union, n_freqs). Per-seed values are NaN outside their actual epoch range,
-    then averaged via nanmean over seeds.
-
-    Handles adaptive_logging correctly : seeds that grok at different epochs have
-    different snapshot counts; their data is interpolated so the X-axis reflects
-    the FULL training range (not truncated to the shortest seed).
-    """
-    raw_eps, raw_mats = [], []
-    for r in runs:
-        h = r['history']
-        if not h.get('fourier_epoch') or key not in h or not h[key]: continue
-        ep = np.array(h['fourier_epoch'])
-        m  = np.array(h[key])
-        if ep.size == 0 or m.size == 0: continue
-        raw_eps.append(ep); raw_mats.append(m)
-    if not raw_mats:
-        return None, None
-    # Union of all epochs (ascending)
-    all_epochs = np.array(sorted(set().union(*[set(ep.tolist()) for ep in raw_eps])))
-    if all_epochs.size == 0:
-        return None, None
-    n_freqs = raw_mats[0].shape[1]
-    # Interpolate per seed × per freq onto the common grid
-    interp = np.full((len(raw_mats), len(all_epochs), n_freqs), np.nan)
-    for i, (ep, m) in enumerate(zip(raw_eps, raw_mats)):
-        for j in range(n_freqs):
-            interp[i, :, j] = np.interp(all_epochs, ep, m[:, j],
-                                          left=np.nan, right=np.nan)
-    with np.errstate(all='ignore'):
-        mean_mat = np.nanmean(interp, axis=0)
-    return all_epochs, mean_mat
-
-
 def epoch_mean_crosses(runs, key, thresh, *, time_key='epoch'):
     """First epoch where the MEAN across seeds crosses `thresh` (aligned with bold mean curve).
     Uses nanmean to ignore NaN-padded entries from seeds with shorter history."""
@@ -161,19 +99,6 @@ def epoch_mean_crosses(runs, key, thresh, *, time_key='epoch'):
 def compute_grokking_markers(runs, *, mem_thresh=0.99, grok_thresh=0.99,
                               circuit_key=None, circuit_thresh=0.5):
     """Returns dict with mem, circuit, grok markers.
-
-    Each marker is the first epoch where the **MEAN curve across seeds** crosses the
-    threshold. This definition is aligned with the bold mean curve plotted by
-    `_plot_band` — same statistical quantity, no ambiguity.
-
-        mem     : first epoch where mean(train_acc) >= mem_thresh
-        circuit : first epoch where mean(<circuit_key>) >= circuit_thresh
-        grok    : first epoch where mean(test_acc) >= grok_thresh
-
-    If `circuit_key` is None (default), auto-detects :
-      - 'wl_keyfreq_concentration' if present in any history (Phase 2 with fixed_key_freqs)
-        — robust for diffuse spectra where top-5 alone is insufficient
-      - else 'wl_top5_concentration' (Phase 1 / Nanda's canonical sparse case)
     """
     if circuit_key is None:
         has_keyfreq = any(r.get('history', {}).get('wl_keyfreq_concentration') for r in runs)
@@ -276,7 +201,7 @@ def plot_curves_band(runs, *, title='Training curves', markers=None,
         ax.set_title(f'L2 norm — {scale} scale')
         ax.legend(loc='best', fontsize=8); ax.grid(True, which='both', alpha=0.3, linestyle=':')
 
-    plt.suptitle(f'{title}   ·   n={len(runs)} seeds   ·   bold = mean, transparent = per-seed, band = min-max',
+    plt.suptitle(f'{title} n={len(runs)} seeds',
                  y=1.005, fontsize=13, fontweight='600')
     plt.tight_layout()
     if save_path is not None:
@@ -287,61 +212,113 @@ def plot_curves_band(runs, *, title='Training curves', markers=None,
 def plot_fourier_losses_band(runs, *, title='Fourier progress losses', markers=None,
                               excluded_key='excluded_all_loss_train',
                               restricted_key='restricted_loss_all',
-                              save_path=None, figsize=(15, 5.5)):
-    """2 panels (excluded | restricted Fourier loss) with train/test reference. Log-log axes.
+                              save_path=None, figsize=None,
+                              show_circuit=True, show_title=True,
+                              shared_legend=False, share_axes=False,
+                              show_accuracy=False,
+                              label_fontsize=12, tick_fontsize=10,
+                              title_fontsize=13, suptitle_fontsize=14,
+                              legend_fontsize=10):
 
-    Nanda 2023 convention (from progress-measures-paper Grokking_Analysis.ipynb) :
-      - excluded_loss : key freqs subtracted, evaluated on TRAIN only       -> excluded_all_loss_train
-      - restricted_loss : projected onto key freqs, evaluated on ALL p*p   -> restricted_loss_all
-    Pattern : excluded_train rises while restricted_all falls — they cross around grok.
-    """
     markers = markers or {}
     mem, circuit, grok = markers.get('mem'), markers.get('circuit'), markers.get('grok')
+    circuit_to_draw = circuit if show_circuit else None
 
     ep_f, excl      = stack_fourier(runs, excluded_key)
     _,    restr     = stack_fourier(runs, restricted_key)
     ep_l, train_loss = stack(runs, 'train_loss')
     _,    test_loss  = stack(runs, 'test_loss')
+    if show_accuracy:
+        ep_a, train_acc = stack(runs, 'train_acc')
+        _,    test_acc  = stack(runs, 'test_acc')
 
-    fig, axes = plt.subplots(1, 2, figsize=figsize)
-    ax = axes[0]
-    _plot_band(ax, ep_l, train_loss, COL_TRAIN, label='train loss')
-    _plot_band(ax, ep_l, test_loss,  COL_TEST,  label='test loss')
-    if excl is not None:
-        _plot_band(ax, ep_f, excl, COL_EXCLUDED, label='excluded train (key freqs removed)')
-    _add_vlines(ax, mem=mem, circuit=circuit, grok=grok)
-    ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlabel('epoch'); ax.set_ylabel('cross entropy')
-    ax.set_title('Excluded loss (Nanda — train set)')
-    ax.legend(loc='best', fontsize=8); ax.grid(True, which='both', alpha=0.3, linestyle=':')
+    n_panels = 3 if show_accuracy else 2
+    if figsize is None:
+        figsize = (18.5, 5.2) if show_accuracy else (13, 5.2)
 
-    ax = axes[1]
-    _plot_band(ax, ep_l, train_loss, COL_TRAIN, label='train loss')
-    _plot_band(ax, ep_l, test_loss,  COL_TEST,  label='test loss')
-    if restr is not None:
-        _plot_band(ax, ep_f, restr, COL_RESTRICTED, label='restricted all (key freqs only)')
-    _add_vlines(ax, mem=mem, circuit=circuit, grok=grok)
-    ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlabel('epoch'); ax.set_ylabel('cross entropy')
-    ax.set_title('Restricted loss (Nanda — all data)')
-    ax.legend(loc='best', fontsize=8); ax.grid(True, which='both', alpha=0.3, linestyle=':')
+    rc = {
+        'font.size':         label_fontsize,
+        'axes.titlesize':    title_fontsize,
+        'axes.labelsize':    label_fontsize,
+        'xtick.labelsize':   tick_fontsize,
+        'ytick.labelsize':   tick_fontsize,
+        'legend.fontsize':   legend_fontsize,
+        'axes.spines.top':   False,
+        'axes.spines.right': False,
+    }
 
-    plt.suptitle(f'{title}   ·   n={len(runs)} seeds   ·   bold = mean, band = min-max',
-                 y=1.02, fontsize=12, fontweight='600')
-    plt.tight_layout()
-    if save_path is not None:
-        plt.savefig(save_path, bbox_inches='tight', facecolor='white')
-    plt.show()
+    def _decorate(ax, panel_title, ylabel, is_left):
+        _add_vlines(ax, mem=mem, circuit=circuit_to_draw, grok=grok)
+        ax.set_xscale('log'); ax.set_yscale('log')
+        ax.set_xlabel('$log_{10}(epoch)$')
+        if is_left or not share_axes or ylabel != 'cross-entropy loss':
+            ax.set_ylabel(ylabel)
+        ax.set_title(panel_title, fontsize=title_fontsize)
+        if not shared_legend:
+            ax.legend(loc='best', framealpha=0.9)
+        ax.grid(True, which='major', alpha=0.25, linestyle='-',  linewidth=0.5)
+        ax.grid(True, which='minor', alpha=0.12, linestyle=':',  linewidth=0.4)
+
+    with plt.rc_context(rc):
+        # When accuracy is shown, y-scales differ between loss and acc panels :
+        # only share x in that case. Otherwise behave as before.
+        sharey_val = share_axes and not show_accuracy
+        fig, axes = plt.subplots(1, n_panels, figsize=figsize,
+                                  sharex=share_axes, sharey=sharey_val)
+        # Panel layout: when accuracy is shown, [Accuracy | Excluded | Restricted];
+        # otherwise [Excluded | Restricted].
+        panel_order = [1, 2, 0] if show_accuracy else [0, 1]
+        ax = axes[panel_order[0]]
+        _plot_band(ax, ep_l, train_loss, COL_TRAIN, label='train loss')
+        _plot_band(ax, ep_l, test_loss,  COL_TEST,  label='test loss')
+        if excl is not None:
+            _plot_band(ax, ep_f, excl, COL_EXCLUDED, label='excluded loss')
+        _decorate(ax, 'Excluded loss', 'cross-entropy loss', is_left=True)
+
+        ax = axes[panel_order[1]]
+        _plot_band(ax, ep_l, train_loss, COL_TRAIN, label='train loss')
+        _plot_band(ax, ep_l, test_loss,  COL_TEST,  label='test loss')
+        if restr is not None:
+            _plot_band(ax, ep_f, restr, COL_RESTRICTED, label='restricted loss')
+        _decorate(ax, 'Restricted loss', 'cross-entropy loss', is_left=False)
+
+        if show_accuracy:
+            ax = axes[panel_order[2]]
+            _plot_band(ax, ep_a, train_acc, COL_TRAIN, label='train acc')
+            _plot_band(ax, ep_a, test_acc,  COL_TEST,  label='test acc')
+            _decorate(ax, 'Accuracy', 'accuracy', is_left=False)
+
+        if title and show_title:
+            fig.suptitle(title, y=1.005, fontsize=suptitle_fontsize, fontweight='600')
+
+        if shared_legend:
+            seen, handles, labels = set(), [], []
+            for ax in axes:
+                for h, l in zip(*ax.get_legend_handles_labels()):
+                    if l and l not in seen:
+                        seen.add(l); handles.append(h); labels.append(l)
+                if ax.get_legend() is not None:
+                    ax.get_legend().remove()
+            fig.legend(handles, labels, loc='center left',
+                       bbox_to_anchor=(1.0, 0.5), frameon=True, framealpha=0.9)
+            plt.tight_layout(rect=[0, 0, 0.88 if show_accuracy else 0.86, 1])
+        else:
+            plt.tight_layout()
+
+        if save_path is not None:
+            sp = Path(save_path)
+            plt.savefig(sp, bbox_inches='tight', facecolor='white', dpi=300)
+            if sp.suffix.lower() == '.png':
+                plt.savefig(sp.with_suffix('.pdf'), bbox_inches='tight', facecolor='white')
+        plt.show()
 
 
 def plot_freq_mass_heatmap_per_seed(runs, *, title='Frequency mass evolution (per seed)',
-                                     markers=None, save_path=None, figsize_per_seed=(13, 2.6)):
-    """Per-seed heatmap (epoch × freq) grid : one row per seed, columns = W_L | W_E.
-
-    No averaging across seeds — each row shows the true trajectory of one specific run.
-    Useful when seeds have heterogeneous spectra (e.g. diffuse-solution configs like
-    muon_m0_fast / egd_m0_fast where the mean would smear key freqs across seeds).
-    """
+                                     markers=None, save_path=None, figsize_per_seed=(13, 2.6),
+                                     show_title=True,
+                                     label_fontsize=12, tick_fontsize=10,
+                                     title_fontsize=10, suptitle_fontsize=12,
+                                     legend_fontsize=9):
     markers = markers or {}
     mem, circuit, grok = markers.get('mem'), markers.get('circuit'), markers.get('grok')
 
@@ -351,50 +328,64 @@ def plot_freq_mass_heatmap_per_seed(runs, *, title='Frequency mass evolution (pe
         print('plot_freq_mass_heatmap_per_seed: no Fourier snapshots'); return None
 
     n_seeds = len(valid)
-    fig, axes = plt.subplots(n_seeds, 2,
-                              figsize=(figsize_per_seed[0], figsize_per_seed[1] * n_seeds),
-                              squeeze=False)
+    rc = {
+        'font.size':       label_fontsize,
+        'axes.labelsize':  label_fontsize,
+        'axes.titlesize':  title_fontsize,
+        'xtick.labelsize': tick_fontsize,
+        'ytick.labelsize': tick_fontsize,
+        'legend.fontsize': legend_fontsize,
+    }
 
-    for row_idx, r in enumerate(valid):
-        h    = r['history']
-        seed = r.get('seed', row_idx)
-        ep   = np.array(h['fourier_epoch'])
-        for col, (key, panel_label) in enumerate([
-            ('wl_frequency_masses', 'W_L (neuron-logit)'),
-            ('we_frequency_masses', 'W_E (embedding)'),
-        ]):
-            ax  = axes[row_idx, col]
-            mat = np.array(h.get(key, []))
-            if mat.size == 0:
-                ax.text(0.5, 0.5, f'{key} N/A', ha='center', va='center',
-                        transform=ax.transAxes, fontsize=10, color='#999')
-                ax.set_title(f'seed {seed} — {panel_label}', fontsize=10); continue
-            vmin = max(1e-6, mat[mat > 0].min()) if (mat > 0).any() else 1e-6
-            im = ax.imshow(mat.T, aspect='auto', cmap='magma', origin='lower',
-                           extent=[ep[0], ep[-1], 1, mat.shape[1]],
-                           norm=LogNorm(vmin=vmin, vmax=mat.max()))
-            _add_vlines(ax, mem=mem, circuit=circuit, grok=grok, show_labels=(row_idx == 0))
-            ax.set_xlabel('epoch' if row_idx == n_seeds - 1 else '')
-            ax.set_ylabel('freq k')
-            ax.set_title(f'seed {seed} — {panel_label}', fontsize=10)
-            plt.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+    with plt.rc_context(rc):
+        fig, axes = plt.subplots(n_seeds, 2,
+                                  figsize=(figsize_per_seed[0], figsize_per_seed[1] * n_seeds),
+                                  squeeze=False)
 
-    plt.suptitle(f'{title}   ·   n={n_seeds} seeds (one row each)',
-                 y=1.001, fontsize=12, fontweight='600')
-    plt.tight_layout()
-    if save_path is not None:
-        plt.savefig(save_path, bbox_inches='tight', facecolor='white')
-    plt.show()
+        for row_idx, r in enumerate(valid):
+            h    = r['history']
+            seed = r.get('seed', row_idx)
+            ep   = np.array(h['fourier_epoch'])
+            for col, (key, panel_label) in enumerate([
+                ('we_frequency_masses', '$W_E$ (embedding)'),
+                ('wl_frequency_masses', '$W_L$ (neuron-logit)'),
+            ]):
+                ax  = axes[row_idx, col]
+                mat = np.array(h.get(key, []))
+                if mat.size == 0:
+                    ax.text(0.5, 0.5, f'{key} N/A', ha='center', va='center',
+                            transform=ax.transAxes, fontsize=tick_fontsize, color='#999')
+                    ax.set_title(f'{panel_label}', fontsize=title_fontsize)
+                    continue
+                vmin = max(1e-6, mat[mat > 0].min()) if (mat > 0).any() else 1e-6
+                im = ax.imshow(mat.T, aspect='auto', cmap='magma', origin='lower',
+                               extent=[ep[0], ep[-1], 1, mat.shape[1]],
+                               norm=LogNorm(vmin=vmin, vmax=mat.max()))
+                _add_vlines(ax, mem=mem, circuit=circuit, grok=grok,
+                            show_labels=(row_idx == 0))
+                ax.set_xlabel('epoch' if row_idx == n_seeds - 1 else '',
+                              fontsize=label_fontsize)
+                ax.set_ylabel('frequencies', fontsize=label_fontsize)
+                ax.set_title(f'{panel_label}', fontsize=title_fontsize)
+                cb = plt.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+                cb.ax.tick_params(labelsize=tick_fontsize)
+                if row_idx == 0:
+                    ax.legend(loc='best', fontsize=legend_fontsize, framealpha=0.85)
+
+        if show_title:
+            plt.suptitle(f'{title}   ·   n={n_seeds} seeds (one row each)',
+                         y=1.001, fontsize=suptitle_fontsize, fontweight='600')
+        plt.tight_layout()
+        if save_path is not None:
+            sp = Path(save_path)
+            plt.savefig(sp, bbox_inches='tight', facecolor='white', dpi=300)
+            if sp.suffix.lower() == '.png':
+                plt.savefig(sp.with_suffix('.pdf'), bbox_inches='tight', facecolor='white')
+        plt.show()
 
 
 def plot_sparsity(runs, *, title='Spectral sparsity', markers=None,
                    save_path=None, figsize=(18, 9)):
-    """6 panels : concentration (key_freqs if available, else top-5), entropy, gini for WL/WE.
-
-    For the concentration metric : if `wl_keyfreq_concentration` exists in history (Phase 2 with
-    fixed_key_freqs), uses that — measures mass in the FIXED key freqs. Else falls back to
-    `wl_top5_concentration` which measures mass in top-5 of the current spectrum.
-    """
     markers = markers or {}
     mem, circuit, grok = markers.get('mem'), markers.get('circuit'), markers.get('grok')
 
@@ -439,30 +430,15 @@ def plot_sparsity(runs, *, title='Spectral sparsity', markers=None,
 # =============================================================================
 # Nanda-style Fourier component bar chart
 # =============================================================================
-def plot_fourier_components(save_root, seeds, config, *,
-                             title='Fourier components',
-                             save_path=None, figsize=(16, 5),
-                             color_cos='#ff7f0e', color_sin='#1f77b4',
-                             show_seeds=True):
-    """Bar chart Nanda-style : Fourier components of W_E and W_U (neuron-logit map).
-
-    Loads `seedN/model.pt` for each seed, projects W_E and W_U on the real Fourier basis
-    over Z_p, computes L2 norm of cos and sin components per frequency.
-
-    Returns
-    -------
-    dict : {seed: {'we_cos','we_sin','wu_cos','wu_sin'}} of np.ndarray (length p//2)
-    """
+def load_fourier_components(save_root, seeds, config):
+    """Load model.pt per seed and project W_E, W_L on the Fourier basis."""
     from fourier_metrics import make_fourier_basis
 
     save_root = Path(save_root)
     p = config.p
-
     basis    = make_fourier_basis(config).cpu()
-    cos_rows = basis[1::2]    # (p//2, p) : cos(1), cos(2), ...
-    sin_rows = basis[2::2]    # (p//2, p) : sin(1), sin(2), ...
-    n_freqs  = cos_rows.shape[0]
-    freqs    = np.arange(1, n_freqs + 1)
+    cos_rows = basis[1::2]
+    sin_rows = basis[2::2]
 
     def _find_param(state, suffix):
         for k, v in state.items():
@@ -482,22 +458,44 @@ def plot_fourier_components(save_root, seeds, config, *,
         W_out = _find_param(state, 'W_out')
         if W_E is None or W_U is None or W_out is None:
             raise KeyError(f'W_E / W_U / W_out not found in {mp}. Keys: {list(state)}')
-        # W_E projection along vocab axis
-        W_E_p = W_E[:, :p].float().cpu()                         # (d_model, p)
-        # W_L = neuron-logit map = W_U[:, :p].T @ W_out (cf. fourier_metrics.wl_frequency_masses)
-        W_L   = (W_U[:, :p].float().cpu().T) @ W_out.float().cpu()  # (p, d_mlp)
+        W_E_p = W_E[:, :p].float().cpu()
+        W_L   = (W_U[:, :p].float().cpu().T) @ W_out.float().cpu()
         per_seed[s] = {
-            'we_cos': (W_E_p @ cos_rows.T).norm(dim=0).numpy(),    # (p//2,) norm over d_model
-            'we_sin': (W_E_p @ sin_rows.T).norm(dim=0).numpy(),
-            'wl_cos': (cos_rows @ W_L).norm(dim=1).numpy(),         # (p//2,) norm over d_mlp
-            'wl_sin': (sin_rows @ W_L).norm(dim=1).numpy(),
-            # stashed raw matrices : needed by identify_key_freqs(method='permutation')
-            '_W_L':       W_L.numpy(),                              # (p, d_mlp)
-            '_basis_cos': cos_rows.numpy(),                         # (p//2, p)
-            '_basis_sin': sin_rows.numpy(),                         # (p//2, p)
+            'we_cos':     (W_E_p @ cos_rows.T).norm(dim=0).numpy(),
+            'we_sin':     (W_E_p @ sin_rows.T).norm(dim=0).numpy(),
+            'wl_cos':     (cos_rows @ W_L).norm(dim=1).numpy(),
+            'wl_sin':     (sin_rows @ W_L).norm(dim=1).numpy(),
+            '_W_L':       W_L.numpy(),
+            '_basis_cos': cos_rows.numpy(),
+            '_basis_sin': sin_rows.numpy(),
         }
+    return per_seed
+
+
+def converged_seeds(save_root, seeds, thresh=0.99):
+    """Return seeds whose final test_acc reaches thresh, read from history.json."""
+    save_root = Path(save_root)
+    out = []
+    for s in seeds:
+        hp = save_root / f'seed{s}' / 'history.json'
+        if not hp.exists(): continue
+        h = json.loads(hp.read_text())
+        if h.get('test_acc') and h['test_acc'][-1] >= thresh:
+            out.append(s)
+    return out
+
+
+def plot_fourier_components(save_root, seeds, config, *,
+                             title='Fourier components',
+                             save_path=None, figsize=(16, 5),
+                             color_cos='#ff7f0e', color_sin='#1f77b4',
+                             show_seeds=True):
+    per_seed = load_fourier_components(save_root, seeds, config)
     if not per_seed:
         print(f'plot_fourier_components: no seeds loaded from {save_root}'); return None
+
+    n_freqs = len(next(iter(per_seed.values()))['we_cos'])
+    freqs   = np.arange(1, n_freqs + 1)
 
     def _agg(key):
         stk = np.array([per_seed[s][key] for s in per_seed])
@@ -539,48 +537,16 @@ def plot_fourier_components(save_root, seeds, config, *,
 def identify_key_freqs(
     per_seed_components,
     *,
-    method: str = 'topk',            # 'topk' | 'cum_energy' | 'permutation'  (default = legacy, Phase 2 unchanged)
-    tau: float = 0.90,               # for 'cum_energy'
-    n_perms: int = 500,              # for 'permutation'
-    alpha: float = 0.05,             # for 'permutation' : significance level
-    correction: str = 'fdr',         # 'fdr' (Benjamini-Hochberg) | 'bonferroni' | None
-    max_k: int = 20,                 # hard cap (all methods) — safety net
-    k: int = 5,                      # for 'topk' (legacy)
-    rng_seed: int = 42,              # for permutation reproducibility
+    method: str = 'topk',            
+    tau: float = 0.90,               
+    n_perms: int = 500,            
+    alpha: float = 0.05,             
+    correction: str = 'fdr',         
+    max_k: int = 20,               
+    k: int = 5,                      
+    rng_seed: int = 42,              
     verbose: bool = True,
 ):
-    """Extract per-seed key frequencies via one of three selection methods.
-
-    Score per freq = wl_cos² + wl_sin² — uses **only the Neuron-Logit map W_L** (not W_E),
-    consistent with `fourier_metrics.choose_key_freqs_from_wl` (Nanda's canonical method).
-
-    Methods (from least to most rigorous)
-    --------------------------------------
-    'topk' (legacy)  : top-`k` freqs by W_L mass (Nanda's hardcoded k=5).
-                       Pros : simple. Cons : fixed k ignores per-seed sparsity.
-
-    'cum_energy'     : smallest k such that ∑ top-k masses ≥ `tau` × total mass.
-                       Parseval-grounded — keeps freqs explaining `tau` fraction of W_L's
-                       spectral energy. Default `tau=0.90`. Adapts to per-seed sparsity.
-
-    'permutation'    : statistical test against a row-shuffle null of W_L (most rigorous).
-                       For each seed, n_perms row-permutations of W_L define the null mass
-                       distribution per freq. A freq is "key" if observed mass exceeds the
-                       null at level `alpha`, with multiple-testing correction (`fdr` or
-                       `bonferroni`). Requires `_W_L`, `_basis_cos`, `_basis_sin` stashed
-                       by `plot_fourier_components` (already patched).
-
-    All methods apply a hard cap `max_k` (selects top `max_k` by mass if exceeded).
-
-    Returns
-    -------
-    dict with :
-        'per_seed'  : {seed : sorted key freqs (1-indexed)}
-        'consensus' : freqs selected in ALL seeds
-        'majority'  : freqs selected in (n//2 + 1) seeds
-        'method'    : the method used (for traceability)
-        'info'      : per-seed extra info (n_keep, energy_captured, min_pval, …)
-    """
     if per_seed_components is None or not per_seed_components:
         return {'per_seed': {}, 'consensus': [], 'majority': [],
                 'method': method, 'info': {}}
@@ -697,54 +663,14 @@ def plot_fourier_components_per_seed(save_root, seeds, config, *,
                                       title='Per-seed Fourier components',
                                       save_path=None, row_height=2.3,
                                       color_cos='#ff7f0e', color_sin='#1f77b4'):
-    """One row per seed showing W_E (left) and W_U (right) Fourier components.
-
-    Useful to inspect seed-to-seed variability — do they find the same key freqs ?
-    Returns the per-seed dict (same as plot_fourier_components).
-    """
-    from fourier_metrics import make_fourier_basis
-
-    save_root = Path(save_root)
-    p = config.p
-    basis    = make_fourier_basis(config).cpu()
-    cos_rows = basis[1::2]
-    sin_rows = basis[2::2]
-    n_freqs  = cos_rows.shape[0]
-    freqs    = np.arange(1, n_freqs + 1)
-
-    def _find_param(state, suffix):
-        for k, v in state.items():
-            if k.endswith(suffix): return v
-        return None
-
-    seeds_data = []
-    for s in seeds:
-        mp = save_root / f'seed{s}' / 'model.pt'
-        if not mp.exists():
-            print(f'  skip seed {s} : {mp} not found'); continue
-        state = t.load(mp, map_location='cpu')
-        if isinstance(state, dict) and 'model_state_dict' in state:
-            state = state['model_state_dict']
-        W_E   = _find_param(state, 'W_E')
-        W_U   = _find_param(state, 'W_U')
-        W_out = _find_param(state, 'W_out')
-        if W_E is None or W_U is None or W_out is None:
-            raise KeyError(f'W_E / W_U / W_out not found in {mp}.')
-        W_E_p = W_E[:, :p].float().cpu()
-        # W_L = neuron-logit map = W_U[:, :p].T @ W_out
-        W_L   = (W_U[:, :p].float().cpu().T) @ W_out.float().cpu()
-        seeds_data.append({
-            'seed': s,
-            'we_cos': (W_E_p @ cos_rows.T).norm(dim=0).numpy(),
-            'we_sin': (W_E_p @ sin_rows.T).norm(dim=0).numpy(),
-            'wl_cos': (cos_rows @ W_L).norm(dim=1).numpy(),
-            'wl_sin': (sin_rows @ W_L).norm(dim=1).numpy(),
-        })
-
-    if not seeds_data:
+    per_seed = load_fourier_components(save_root, seeds, config)
+    if not per_seed:
         print(f'plot_fourier_components_per_seed: no seeds loaded'); return None
 
-    n_seeds = len(seeds_data)
+    n_freqs    = len(next(iter(per_seed.values()))['we_cos'])
+    freqs      = np.arange(1, n_freqs + 1)
+    seeds_data = [{'seed': s, **per_seed[s]} for s in per_seed]
+    n_seeds    = len(seeds_data)
     fig, axes = plt.subplots(n_seeds, 2, figsize=(16, row_height * n_seeds))
     if n_seeds == 1: axes = axes.reshape(1, -1)
     width = 0.42
@@ -784,12 +710,7 @@ def plot_freq_mass_heatmap_3d_per_seed(runs, *, key='wl_frequency_masses',
                                          log_z=True, log_x=False,
                                          figsize=(14, 8), elev=30, azim=-60,
                                          cmap='magma'):
-    """3D surface plot per seed (one figure per seed) : (epoch × freq) → mass.
 
-    No averaging — each figure shows the true trajectory of one specific run.
-    Vertical lines at mem/circuit/grok markers shown as dashed segments on the floor.
-    `save_path` : if given, suffixed with `_seed{s}` per figure.
-    """
     from mpl_toolkits.mplot3d import Axes3D   # noqa: F401  (registers '3d')
     markers = markers or {}
 
@@ -859,12 +780,6 @@ def plot_freq_mass_heatmap_3d_plotly_per_seed(runs, *, key='wl_frequency_masses'
                                                 log_z=True, log_x=False,
                                                 width=1100, height=750,
                                                 colorscale='Magma'):
-    """3D interactive Plotly surface plot, one figure per seed.
-
-    No averaging — each figure shows the true trajectory of one specific run.
-    Rotate / zoom / pan with the mouse. Hover for exact (epoch, k, mass) values.
-    `save_path` : if given, suffixed with `_seed{s}` per figure (.html for interactive).
-    """
     import plotly.graph_objects as go
     markers = markers or {}
 
@@ -948,3 +863,268 @@ def plot_freq_mass_heatmap_3d_plotly_per_seed(runs, *, key='wl_frequency_masses'
         fig.show()
         figures.append(fig)
     return figures
+
+
+# =============================================================================
+# Grid-search heatmap
+# =============================================================================
+def heatmap_panel(ax, df, x_key, y_key, title, *,
+                  value='eg_med', fixed=None, log=True,
+                  vmin=None, vmax=None, cmap='viridis_r', fmt='.0f',
+                  cbar_label=None):
+    """One heatmap panel of a hyperparameter grid result.
+    """
+    import seaborn as sns
+
+    sub = df if fixed is None else df.query(' and '.join(f'{k}=={v}' for k, v in fixed.items()))
+    piv = sub.pivot(index=y_key, columns=x_key, values=value).sort_index(ascending=False)
+    vals = np.log10(piv.values) if log else piv.values
+    tested = set(map(tuple, sub[[y_key, x_key]].values))
+    untested = np.array([[(y, x) not in tested for x in piv.columns] for y in piv.index])
+    nogrok = (np.isnan(piv.values) & ~untested
+              if value == 'eg_med'
+              else np.zeros_like(piv.values, dtype=bool))
+    mask = untested | nogrok
+    if vmin is None: vmin = np.nanmin(vals)
+    if vmax is None: vmax = np.nanmax(vals)
+    label = cbar_label or (f'log10({value})' if log else value)
+    sns.heatmap(vals, ax=ax, mask=mask, cmap=cmap, vmin=vmin, vmax=vmax,
+                annot=piv.values, fmt=fmt, cbar=True,
+                cbar_kws={'label': label},
+                xticklabels=[f'{c:g}' for c in piv.columns],
+                yticklabels=[f'{i:g}' for i in piv.index],
+                linewidths=0.5, linecolor='white', annot_kws={'fontsize': 9})
+    for i, j in zip(*np.where(nogrok)):
+        ax.text(j + 0.5, i + 0.5, '✗', ha='center', va='center',
+                color='#aa3333', fontsize=14, fontweight='bold')
+    for i, j in zip(*np.where(untested)):
+        ax.add_patch(plt.Rectangle((j, i), 1, 1, fill=True,
+                                    facecolor='#f5f5f5', edgecolor='white', lw=0.5))
+        ax.text(j + 0.5, i + 0.5, '·', ha='center', va='center',
+                color='#999999', fontsize=14)
+    ax.set_title(title); ax.set_xlabel(x_key); ax.set_ylabel(y_key)
+
+
+def plot_grid_grokking_step(panels, *, value='eg_med', log=True,
+                             suptitle=None, save_path=None,
+                             figsize=None, panel_width=5.2, panel_height=4.5):
+    """Render a single-row multi-panel `heatmap_panel` grid for a hp sweep.
+
+    Parameters
+    ----------
+    panels   : list of dicts, each with keys
+                 'df'    : aggregated grid dataframe
+                 'x_key' : column for x axis
+                 'y_key' : column for y axis
+                 'title' : panel title
+                 'fixed' : optional dict of column->value filters
+                 (extra keys are forwarded to heatmap_panel)
+    value    : column passed to each panel (default 'eg_med').
+    log      : log10 color scale (default True).
+    suptitle : optional figure-level title.
+    save_path : if given, saves .png at dpi=200 and a sibling .pdf.
+    """
+    n = len(panels)
+    if figsize is None:
+        figsize = (panel_width * n, panel_height)
+    fig, axes = plt.subplots(1, n, figsize=figsize)
+    if n == 1:
+        axes = [axes]
+    for ax, p in zip(axes, panels):
+        kw = {k: v for k, v in p.items()
+              if k not in ('df', 'x_key', 'y_key', 'title')}
+        kw.setdefault('value', value)
+        kw.setdefault('log', log)
+        heatmap_panel(ax, p['df'], p['x_key'], p['y_key'], p['title'], **kw)
+    if suptitle:
+        plt.suptitle(suptitle, y=1.02, fontsize=13, fontweight='600')
+    plt.tight_layout()
+    if save_path is not None:
+        sp = Path(save_path)
+        plt.savefig(sp, bbox_inches='tight', facecolor='white', dpi=200)
+        if sp.suffix.lower() == '.png':
+            plt.savefig(sp.with_suffix('.pdf'), bbox_inches='tight', facecolor='white')
+    plt.show()
+
+
+# =============================================================================
+# Per-seed marker extraction + synthesis figures
+# =============================================================================
+def _interp_crossing(epochs, values, thresh, *, above=True):
+    epochs = np.asarray(epochs, dtype=float)
+    v = np.asarray(values, dtype=float)
+    ok = (v >= thresh) if above else (v <= thresh)
+    idx = np.argmax(ok) if ok.any() else None
+    if idx is None or idx == 0:
+        return epochs[0] if (ok.any() and idx == 0) else np.nan
+    e0, e1, v0, v1 = epochs[idx - 1], epochs[idx], v[idx - 1], v[idx]
+    if v1 == v0:
+        return e1
+    frac = (thresh - v0) / (v1 - v0)
+    return e0 + frac * (e1 - e0)
+
+
+def _extract_seed_markers(save_root, seed):
+    """Compute every per-seed timing / dynamics marker from a single history.json."""
+    p = Path(save_root) / f'seed{seed}' / 'history.json'
+    if not p.exists():
+        return None
+    h = json.load(open(p))
+    ep  = np.asarray(h['epoch'], float)
+    fep = np.asarray(h['fourier_epoch'], float)
+    out = {}
+
+    out['T_mem']        = _interp_crossing(ep,  h['train_acc'], 0.99)
+    out['T_grok']       = _interp_crossing(ep,  h['test_acc'],  0.99)
+    out['T_circuit']    = _interp_crossing(fep, h['wl_keyfreq_concentration'], 0.5)
+    out['T_circuit_25'] = _interp_crossing(fep, h['wl_keyfreq_concentration'], 0.25)
+    out['T_circuit_75'] = _interp_crossing(fep, h['wl_keyfreq_concentration'], 0.75)
+    out['T_circuit_90'] = _interp_crossing(fep, h['wl_keyfreq_concentration'], 0.90)
+    out['T_test_50']    = _interp_crossing(ep,  h['test_acc'],  0.5)
+
+    exc = np.asarray(h['excluded_all_loss_train'], float)
+    i_min = int(np.nanargmin(exc))
+    out['exc_min']   = exc[i_min]
+    out['T_exc_min'] = fep[i_min]
+    rec = np.nan
+    for i in range(i_min, len(exc)):
+        if exc[i] >= 1.0:
+            rec = fep[i]; break
+    out['T_exc_recover'] = rec
+    ent = np.nan
+    for i in range(i_min, -1, -1):
+        if exc[i] >= 1.0:
+            ent = fep[i]; break
+    out['T_exc_enter'] = ent
+
+    res = np.asarray(h['restricted_loss_all'], float)
+    out['T_res_01']  = _interp_crossing(fep, res, 0.1, above=False)
+    out['res_final'] = float(np.nanmedian(res[-10:]))
+
+    l2 = np.asarray(h['l2_norm'], float)
+    i_pk = int(np.nanargmax(l2))
+    out['l2_peak']   = l2[i_pk]
+    out['T_l2_peak'] = ep[i_pk]
+    out['l2_final']  = float(np.nanmedian(l2[-10:]))
+    out['l2_init']   = l2[0]
+
+    gini = np.asarray(h['gini_W_L'], float)
+    out['gini_final'] = float(np.nanmedian(gini[-10:]))
+    out['gini_max']   = float(np.nanmax(gini))
+    out['T_gini_05']  = _interp_crossing(fep, gini, 0.5)
+
+    out['n_keys'] = len(h['key_freqs'][-1])
+
+    masses = np.asarray(h['wl_frequency_masses'], float)
+    kf     = [int(k) for k in h['key_freqs'][-1]]
+    emerg  = np.asarray([
+        _interp_crossing(fep, masses[:, k - 1], 4.0 / 56.0) for k in kf
+    ], float)
+    out['emerg_first']  = np.nanmin(emerg) if len(emerg) else np.nan
+    out['emerg_last']   = np.nanmax(emerg) if len(emerg) else np.nan
+    out['emerg_spread'] = out['emerg_last'] - out['emerg_first']
+
+    out['wl_kf_conc_final'] = float(np.nanmedian(
+        np.asarray(h['wl_keyfreq_concentration'], float)[-10:]))
+    return out
+
+
+def compute_marker_csv(configs, seeds, csv_path):
+    """Build the per-seed markers DataFrame and write it to csv_path.
+
+    configs : list of dicts with keys 'label', 'save_root', 'family', 'momentum', 'regime'.
+    """
+    rows = []
+    for cfg in configs:
+        for s in seeds:
+            r = _extract_seed_markers(cfg['save_root'], s)
+            if r is None:
+                print(f'missing: {cfg["label"]} seed{s}'); continue
+            r.update(dict(config=cfg['label'], family=cfg['family'],
+                          momentum=cfg['momentum'], regime=cfg['regime'], seed=s))
+            rows.append(r)
+    df = pd.DataFrame(rows)
+    df['gap']           = df['T_grok'] - df['T_mem']
+    df['gap_ratio']     = df['T_grok'] / df['T_mem']
+    df['circuit_lead']  = df['T_grok'] - df['T_circuit']
+    df['cleanup_dur']   = df['T_exc_recover'] - df['T_exc_min']
+    df['dip_width']     = df['T_exc_recover'] - df['T_exc_enter']
+    df['mem_to_excmin'] = df['T_exc_min'] - df['T_mem']
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_path, index=False)
+    return df
+
+
+def plot_pr_width(configs, markers_csv, save_path, *, seeds=range(5)):
+    """Effective circuit width: PR(t) of W_L freq masses on a grok-normalized log grid."""
+    mk = pd.read_csv(markers_csv).set_index(['config', 'seed'])
+    fig, ax = plt.subplots(figsize=(10.5, 6))
+    grid = np.logspace(-2.2, np.log10(60), 400)
+    for cfg in configs:
+        curves = []
+        for s in seeds:
+            hp = Path(cfg['save_root']) / f'seed{s}' / 'history.json'
+            if not hp.exists(): continue
+            h = json.load(open(hp))
+            fep = np.asarray(h['fourier_epoch'], float)
+            M   = np.asarray(h['wl_frequency_masses'], float)
+            M   = M / M.sum(axis=1, keepdims=True)
+            PR  = 1.0 / np.sum(M**2, axis=1)
+            try:
+                tg = mk.loc[(cfg['label'], s), 'T_grok']
+            except KeyError:
+                continue
+            x = fep / tg
+            keep = x > 0
+            curves.append(np.interp(grid, x[keep], PR[keep], left=np.nan, right=np.nan))
+        if not curves: continue
+        mean = np.nanmean(np.vstack(curves), axis=0)
+        ax.plot(grid, mean, color=cfg['color'], lw=1.9, label=cfg['label'],
+                ls='-' if 'fast' in cfg['label'] else '--')
+    ax.axvline(1.0, color='k', lw=1.2, alpha=0.7)
+    ax.text(1.04, 50, '$T_{grok}$', fontsize=11)
+    ax.set_xscale('log')
+    ax.set_xlabel('epoch / $T_{grok}$ (per seed)')
+    ax.set_ylabel('participation ratio of $W_L$ freq masses\n'
+                  '(effective # of active frequencies)')
+    ax.set_title('Effective circuit width along the (grok-normalized) trajectory'
+                 ' — mean over 5 seeds')
+    ax.grid(alpha=0.3, ls=':')
+    ax.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=140, facecolor='white')
+    plt.show()
+
+
+def plot_tcircuit_vs_tgrok(configs, markers_csv, save_path):
+    """Per-seed scatter of T_circuit vs T_grok with the diagonal ordering guide."""
+    df = pd.read_csv(markers_csv)
+    fig, ax = plt.subplots(figsize=(7.5, 7))
+    for cfg in configs:
+        sub = df[df.config == cfg['label']]
+        ax.scatter(sub['T_grok'], sub['T_circuit'], color=cfg['color'], s=55,
+                   marker='o' if 'fast' in cfg['label'] else 's', label=cfg['label'],
+                   edgecolor='k', linewidth=0.4, zorder=3)
+    lims = [80, 30000]
+    ax.plot(lims, lims, 'k-', lw=1, alpha=0.6)
+    ax.fill_between(lims, lims, [lims[1]] * 2, color='red', alpha=0.05)
+    ax.text(110, 16000, 'circuit concentrates\nAFTER grokking',
+            fontsize=10, color='darkred')
+    ax.text(2500, 200, 'classic order:\ncircuit before grokking',
+            fontsize=10, color='darkgreen')
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlim(lims); ax.set_ylim(lims)
+    ax.set_xlabel('$T_{grok}$ (test acc >= 0.99)')
+    ax.set_ylabel('$T_{circuit}$ ($W_L$ key-freq concentration >= 0.5)')
+    ax.set_title('Per-seed circuit-formation vs grokking time')
+    ax.grid(alpha=0.3, ls=':')
+    ax.legend(fontsize=8, loc='upper left')
+    plt.tight_layout()
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=140, facecolor='white')
+    plt.show()

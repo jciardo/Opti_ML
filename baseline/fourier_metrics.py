@@ -1,8 +1,17 @@
-from __future__ import annotations
+"""
+Nanda-style Fourier metric measures for the modular-addition toy transformer.
+Reference: Nanda et. al(2023),
+"Progress measures for grokking via mechanistic interpretability"
+(https://arxiv.org/abs/2301.05217).
 
+Reference implementation: the Grokking_Analysis.ipynb notebook from
+https://github.com/mechanistic-interpretability/progress-measures-paper —
+
+"""
+
+from __future__ import annotations
 import math
 from typing import Iterable, Optional
-
 import einops
 import torch as t
 import torch.nn.functional as F
@@ -331,8 +340,8 @@ def fourier_metrics(
             if key_freqs else [],
     })
 
-    # Concentration spectrale dans les key_freqs FIXES (uniquement si key_freqs fournis).
-    # Mesure : fraction de la masse spectrale concentrée dans les freqs identifiées en Phase 1.
+    # Spectral concentration on the fixed key_freqs (only when caller provided them):
+    # fraction of the spectral mass carried by the freqs identified in Phase 1.
     if key_freqs:
         key_idx = [k - 1 for k in key_freqs if 1 <= k <= len(wl_masses)]
         if key_idx:

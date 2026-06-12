@@ -1,2 +1,14 @@
 *.pt
 *.png
+*.pdf
+*.jpg
+*.jpeg
+*.gif
+!nanda_baseline_3d_seed0.gif
+*.svg
+*.html
+runs/**/*
+!runs/
+!runs/**/
+!runs/**/*.json
+analysis_csv/
