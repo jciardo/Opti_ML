@@ -58,7 +58,7 @@ def plot_fourier_loss_comparison(
     title: str = "Nanda Fourier progress losses",
     *,
     excluded_key: str = "excluded_all_loss_train",
-    restricted_key: str = "restricted_loss_test",
+    restricted_key: str = "restricted_loss_all",
 ) -> None:
     """Plot train/test loss against excluded and restricted Fourier losses.
 
@@ -583,7 +583,7 @@ def plot_fourier_loss_multiseed(
     *,
     title: str = "Fourier progress losses",
     excluded_key: str = "excluded_all_loss_train",
-    restricted_key: str = "restricted_loss_test",
+    restricted_key: str = "restricted_loss_all",
     mem_med=None, circuit_med=None, grok_med=None,
     save_path=None,
     figsize: tuple = (15, 5.5),

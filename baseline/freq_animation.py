@@ -22,34 +22,36 @@ import numpy as np
 
 
 # =============================================================================
-# Internal helper : robust multi-seed stacking (handles adaptive_logging)
+# Internal helper : pick one seed (no averaging)
 # =============================================================================
-def _stack_freq_matrix(runs, key='wl_frequency_masses'):
-    """Stack per-seed (n_snapshots × n_freqs) Fourier matrices on a common epoch grid
-    via interpolation. Returns (epochs, mean_matrix). Mean is nan-aware to handle seeds
-    with shorter histories (e.g. early-grok seeds with adaptive_logging)."""
-    raw_eps, raw_mats = [], []
+def _extract_seed_matrix(runs, key='wl_frequency_masses', seed=None):
+    """Return (epochs, mat, seed_id) for a SINGLE seed. No averaging.
+
+    If `seed` is None, picks the first valid seed and prints which one was used.
+    If `seed` is an int, looks for that specific seed ; returns (None, None, None) if absent.
+    """
+    valid = []
     for r in runs:
-        h = r['history']
+        h = r.get('history', {})
         if not h.get('fourier_epoch') or key not in h or not h[key]: continue
         ep = np.array(h['fourier_epoch'])
         m  = np.array(h[key])
         if ep.size == 0 or m.size == 0: continue
-        raw_eps.append(ep); raw_mats.append(m)
-    if not raw_mats:
-        return None, None
-    all_epochs = np.array(sorted(set().union(*[set(ep.tolist()) for ep in raw_eps])))
-    if all_epochs.size == 0:
-        return None, None
-    n_freqs = raw_mats[0].shape[1]
-    interp = np.full((len(raw_mats), len(all_epochs), n_freqs), np.nan)
-    for i, (ep, m) in enumerate(zip(raw_eps, raw_mats)):
-        for j in range(n_freqs):
-            interp[i, :, j] = np.interp(all_epochs, ep, m[:, j],
-                                          left=np.nan, right=np.nan)
-    with np.errstate(all='ignore'):
-        mean_mat = np.nanmean(interp, axis=0)
-    return all_epochs, mean_mat
+        valid.append((r.get('seed', '?'), ep, m))
+    if not valid:
+        return None, None, None
+
+    if seed is None:
+        sid, ep, mat = valid[0]
+        print(f'  [animate] seed not specified — using seed={sid} '
+              f'(first of {len(valid)} available : {[s for s, _, _ in valid]})')
+        return ep, mat, sid
+    matches = [(sid, ep, m) for sid, ep, m in valid if sid == seed]
+    if not matches:
+        print(f'  [animate] seed {seed} not found — available: {[s for s, _, _ in valid]}')
+        return None, None, None
+    sid, ep, mat = matches[0]
+    return ep, mat, sid
 
 
 # =============================================================================
@@ -58,6 +60,7 @@ def _stack_freq_matrix(runs, key='wl_frequency_masses'):
 def animate_freq_mass_plotly(
     runs,
     *,
+    seed=None,                    # ← which seed to animate (None = first available)
     key: str = 'wl_frequency_masses',
     title: str = 'Frequency mass emergence — interactive',
     save_path=None,
@@ -67,16 +70,18 @@ def animate_freq_mass_plotly(
     colorscale: str = 'Magma',
     width: int = 1100, height: int = 720,
 ):
-    """3D animated surface plot (Plotly) — the surface "grows" as epochs progress.
+    """3D animated surface plot (Plotly) for a SINGLE seed — the surface "grows" as epochs progress.
 
     At frame t, shows the (epoch × freq → mass) surface from epoch 0 up to epoch t.
     Interactive : slider to scrub, play/pause buttons, rotate with mouse.
+    NO averaging across seeds — pass `seed=<int>` to pick a specific one.
 
     Args
     ----
     runs       : list of {'seed', 'history', ...} (output of viz_analysis.load_seeds)
+    seed       : int, the seed to animate. If None, picks first available with a printed note.
     key        : 'wl_frequency_masses' (default) or 'we_frequency_masses'
-    save_path  : if set, saves to HTML (.html). Otherwise just shown in notebook.
+    save_path  : if set, saves to HTML — auto-suffixes with `_seed{s}` before `.html`.
     n_frames   : number of frames in the animation (downsampled from snapshots)
     log_z      : log10 scale on Z axis (recommended : reveals key freqs)
 
@@ -84,9 +89,10 @@ def animate_freq_mass_plotly(
     """
     import plotly.graph_objects as go
 
-    epochs, mat = _stack_freq_matrix(runs, key=key)
+    epochs, mat, seed_id = _extract_seed_matrix(runs, key=key, seed=seed)
     if mat is None:
         print('animate_freq_mass_plotly: no data'); return None
+    title = f'{title} — seed {seed_id}'
 
     freqs = np.arange(1, mat.shape[1] + 1)
     if log_z:
@@ -174,6 +180,9 @@ def animate_freq_mass_plotly(
         save_path = str(save_path)
         if not save_path.endswith('.html'):
             save_path = save_path.rsplit('.', 1)[0] + '.html'
+        # auto-suffix with _seed{id}
+        stem, ext = save_path.rsplit('.', 1)
+        save_path = f'{stem}_seed{seed_id}.{ext}'
         fig.write_html(save_path)
         print(f'  ✓ saved animated 3D to {save_path}')
 
@@ -187,9 +196,10 @@ def animate_freq_mass_plotly(
 def animate_freq_mass_mpl(
     runs,
     *,
+    seed=None,                          # ← which seed to animate (None = first available)
     key: str = 'wl_frequency_masses',
     title: str = 'Frequency mass emergence',
-    save_path='freq_animation.gif',     # ← default GIF (no ffmpeg needed)
+    save_path='freq_animation.gif',     # ← default GIF (no ffmpeg needed) — suffixed _seed{id}
     log_z: bool = True,
     n_frames: int = 50,                  # ← reduced (3D render is slow)
     fps: int = 10, dpi: int = 90,
@@ -197,31 +207,40 @@ def animate_freq_mass_mpl(
     elev: float = 30, azim: float = -60,
     figsize: tuple = (10, 6),
 ):
-    """3D animated surface plot (matplotlib) — saved as MP4 or GIF.
+    """3D animated surface plot (matplotlib) for a SINGLE seed — saved as MP4 or GIF.
 
-    Auto-detects ffmpeg : if `save_path` is .mp4 but ffmpeg is missing, falls back
-    to .gif automatically. Prints progress every 10% of frames.
+    NO averaging across seeds. Auto-detects ffmpeg : if `save_path` is .mp4 but ffmpeg
+    is missing, falls back to .gif automatically. Prints progress every 10% of frames.
 
     Note : 3D surface animation is SLOW (~1-3s per frame). Use small n_frames
     (50-80) for quick test, larger for final. Plotly version is much faster
     and interactive.
 
     Args :
+        seed      : int, the seed to animate. If None, picks first available.
         n_frames  : number of frames (50 default is fast, ~30s total)
         fps       : frames per second of output video
         dpi       : resolution (90 default; bump to 120+ for HD)
+        save_path : auto-suffixed with `_seed{id}` before extension.
     """
     import shutil
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     from mpl_toolkits.mplot3d import Axes3D   # noqa: F401
 
-    epochs, mat = _stack_freq_matrix(runs, key=key)
+    epochs, mat, seed_id = _extract_seed_matrix(runs, key=key, seed=seed)
     if mat is None:
         print('animate_freq_mass_mpl: no data'); return None
+    title = f'{title} — seed {seed_id}'
 
     # ── Detect writer + auto-correct extension ────────────────────────────────
     save_path = str(save_path)
+    # auto-suffix with _seed{id}
+    if '.' in save_path.rsplit('/', 1)[-1]:
+        stem, _ext = save_path.rsplit('.', 1)
+        save_path = f'{stem}_seed{seed_id}.{_ext}'
+    else:
+        save_path = f'{save_path}_seed{seed_id}.gif'
     ext = save_path.rsplit('.', 1)[-1].lower()
     has_ffmpeg = shutil.which('ffmpeg') is not None
     if ext == 'mp4':

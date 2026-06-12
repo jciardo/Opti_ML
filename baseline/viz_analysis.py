@@ -159,7 +159,7 @@ def epoch_mean_crosses(runs, key, thresh, *, time_key='epoch'):
 
 
 def compute_grokking_markers(runs, *, mem_thresh=0.99, grok_thresh=0.99,
-                              circuit_key='wl_top5_concentration', circuit_thresh=0.5):
+                              circuit_key=None, circuit_thresh=0.5):
     """Returns dict with mem, circuit, grok markers.
 
     Each marker is the first epoch where the **MEAN curve across seeds** crosses the
@@ -167,9 +167,17 @@ def compute_grokking_markers(runs, *, mem_thresh=0.99, grok_thresh=0.99,
     `_plot_band` — same statistical quantity, no ambiguity.
 
         mem     : first epoch where mean(train_acc) >= mem_thresh
-        circuit : first epoch where mean(wl_top5_concentration) >= circuit_thresh
+        circuit : first epoch where mean(<circuit_key>) >= circuit_thresh
         grok    : first epoch where mean(test_acc) >= grok_thresh
+
+    If `circuit_key` is None (default), auto-detects :
+      - 'wl_keyfreq_concentration' if present in any history (Phase 2 with fixed_key_freqs)
+        — robust for diffuse spectra where top-5 alone is insufficient
+      - else 'wl_top5_concentration' (Phase 1 / Nanda's canonical sparse case)
     """
+    if circuit_key is None:
+        has_keyfreq = any(r.get('history', {}).get('wl_keyfreq_concentration') for r in runs)
+        circuit_key = 'wl_keyfreq_concentration' if has_keyfreq else 'wl_top5_concentration'
     return {
         'mem':     epoch_mean_crosses(runs, 'train_acc',  mem_thresh),
         'circuit': epoch_mean_crosses(runs, circuit_key,  circuit_thresh, time_key='fourier_epoch'),
@@ -278,12 +286,14 @@ def plot_curves_band(runs, *, title='Training curves', markers=None,
 
 def plot_fourier_losses_band(runs, *, title='Fourier progress losses', markers=None,
                               excluded_key='excluded_all_loss_train',
-                              restricted_key='restricted_loss_train',
+                              restricted_key='restricted_loss_all',
                               save_path=None, figsize=(15, 5.5)):
     """2 panels (excluded | restricted Fourier loss) with train/test reference. Log-log axes.
 
-    Nanda 2023 convention : both excluded and restricted are computed on the TRAIN set.
-    Pattern : excluded_train rises while restricted_train falls — they cross around grok.
+    Nanda 2023 convention (from progress-measures-paper Grokking_Analysis.ipynb) :
+      - excluded_loss : key freqs subtracted, evaluated on TRAIN only       -> excluded_all_loss_train
+      - restricted_loss : projected onto key freqs, evaluated on ALL p*p   -> restricted_loss_all
+    Pattern : excluded_train rises while restricted_all falls — they cross around grok.
     """
     markers = markers or {}
     mem, circuit, grok = markers.get('mem'), markers.get('circuit'), markers.get('grok')
@@ -309,11 +319,11 @@ def plot_fourier_losses_band(runs, *, title='Fourier progress losses', markers=N
     _plot_band(ax, ep_l, train_loss, COL_TRAIN, label='train loss')
     _plot_band(ax, ep_l, test_loss,  COL_TEST,  label='test loss')
     if restr is not None:
-        _plot_band(ax, ep_f, restr, COL_RESTRICTED, label='restricted train (key freqs only)')
+        _plot_band(ax, ep_f, restr, COL_RESTRICTED, label='restricted all (key freqs only)')
     _add_vlines(ax, mem=mem, circuit=circuit, grok=grok)
     ax.set_xscale('log'); ax.set_yscale('log')
     ax.set_xlabel('epoch'); ax.set_ylabel('cross entropy')
-    ax.set_title('Restricted loss (Nanda — train set)')
+    ax.set_title('Restricted loss (Nanda — all data)')
     ax.legend(loc='best', fontsize=8); ax.grid(True, which='both', alpha=0.3, linestyle=':')
 
     plt.suptitle(f'{title}   ·   n={len(runs)} seeds   ·   bold = mean, band = min-max',
@@ -324,35 +334,53 @@ def plot_fourier_losses_band(runs, *, title='Fourier progress losses', markers=N
     plt.show()
 
 
-def plot_freq_mass_heatmap(runs, *, title='Frequency mass evolution', markers=None,
-                            save_path=None, figsize=(16, 6)):
-    """Heatmap (epoch × freq) for W_L and W_E frequency masses. Magma colormap, log scale."""
+def plot_freq_mass_heatmap_per_seed(runs, *, title='Frequency mass evolution (per seed)',
+                                     markers=None, save_path=None, figsize_per_seed=(13, 2.6)):
+    """Per-seed heatmap (epoch × freq) grid : one row per seed, columns = W_L | W_E.
+
+    No averaging across seeds — each row shows the true trajectory of one specific run.
+    Useful when seeds have heterogeneous spectra (e.g. diffuse-solution configs like
+    muon_m0_fast / egd_m0_fast where the mean would smear key freqs across seeds).
+    """
     markers = markers or {}
     mem, circuit, grok = markers.get('mem'), markers.get('circuit'), markers.get('grok')
 
-    def _freq_mass_matrix(runs, key):
-        return _stack_freq_matrix(runs, key)   # delegate to shared helper
+    valid = [r for r in runs if r.get('history', {}).get('fourier_epoch')
+             and r['history'].get('wl_frequency_masses')]
+    if not valid:
+        print('plot_freq_mass_heatmap_per_seed: no Fourier snapshots'); return None
 
-    fig, axes = plt.subplots(1, 2, figsize=figsize)
-    for ax, (key, panel_title) in zip(axes, [
-        ('wl_frequency_masses', 'W_L (neuron-logit map = $W_U^T W_{out}$) — mean over seeds'),
-        ('we_frequency_masses', 'W_E (embedding) — mean over seeds'),
-    ]):
-        ep_k, mat = _freq_mass_matrix(runs, key=key)
-        if mat is None:
-            ax.text(0.5, 0.5, f'{key} N/A', ha='center', va='center',
-                    transform=ax.transAxes, fontsize=12, color='#999')
-            ax.set_title(panel_title); continue
-        im = ax.imshow(mat.T, aspect='auto', cmap='magma', origin='lower',
-                       extent=[ep_k[0], ep_k[-1], 1, mat.shape[1]],
-                       norm=LogNorm(vmin=max(1e-6, mat[mat>0].min()), vmax=mat.max()))
-        _add_vlines(ax, mem=mem, circuit=circuit, grok=grok)
-        ax.set_xlabel('epoch'); ax.set_ylabel('frequency index k')
-        ax.set_title(panel_title)
-        ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
-        plt.colorbar(im, ax=ax, label='frequency mass (log)')
-    plt.suptitle(f'{title}   ·   horizontal bands = key freqs',
-                 y=1.02, fontsize=13, fontweight='600')
+    n_seeds = len(valid)
+    fig, axes = plt.subplots(n_seeds, 2,
+                              figsize=(figsize_per_seed[0], figsize_per_seed[1] * n_seeds),
+                              squeeze=False)
+
+    for row_idx, r in enumerate(valid):
+        h    = r['history']
+        seed = r.get('seed', row_idx)
+        ep   = np.array(h['fourier_epoch'])
+        for col, (key, panel_label) in enumerate([
+            ('wl_frequency_masses', 'W_L (neuron-logit)'),
+            ('we_frequency_masses', 'W_E (embedding)'),
+        ]):
+            ax  = axes[row_idx, col]
+            mat = np.array(h.get(key, []))
+            if mat.size == 0:
+                ax.text(0.5, 0.5, f'{key} N/A', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=10, color='#999')
+                ax.set_title(f'seed {seed} — {panel_label}', fontsize=10); continue
+            vmin = max(1e-6, mat[mat > 0].min()) if (mat > 0).any() else 1e-6
+            im = ax.imshow(mat.T, aspect='auto', cmap='magma', origin='lower',
+                           extent=[ep[0], ep[-1], 1, mat.shape[1]],
+                           norm=LogNorm(vmin=vmin, vmax=mat.max()))
+            _add_vlines(ax, mem=mem, circuit=circuit, grok=grok, show_labels=(row_idx == 0))
+            ax.set_xlabel('epoch' if row_idx == n_seeds - 1 else '')
+            ax.set_ylabel('freq k')
+            ax.set_title(f'seed {seed} — {panel_label}', fontsize=10)
+            plt.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+
+    plt.suptitle(f'{title}   ·   n={n_seeds} seeds (one row each)',
+                 y=1.001, fontsize=12, fontweight='600')
     plt.tight_layout()
     if save_path is not None:
         plt.savefig(save_path, bbox_inches='tight', facecolor='white')
@@ -750,43 +778,51 @@ def plot_fourier_components_per_seed(save_root, seeds, config, *,
 # =============================================================================
 # 3D frequency mass surface plot
 # =============================================================================
-def plot_freq_mass_heatmap_3d(runs, *, key='wl_frequency_masses',
-                                title='Frequency mass — 3D surface',
-                                markers=None, save_path=None,
-                                log_z=True, log_x=False,
-                                figsize=(14, 8), elev=30, azim=-60,
-                                cmap='magma'):
-    """3D surface plot : (epoch × freq) → mass. Mean over seeds.
+def plot_freq_mass_heatmap_3d_per_seed(runs, *, key='wl_frequency_masses',
+                                         title='Frequency mass — 3D surface (per seed)',
+                                         markers=None, save_path=None,
+                                         log_z=True, log_x=False,
+                                         figsize=(14, 8), elev=30, azim=-60,
+                                         cmap='magma'):
+    """3D surface plot per seed (one figure per seed) : (epoch × freq) → mass.
 
-    Equivalent of `plot_freq_mass_heatmap` but in 3D — z = mass (log scale by default).
+    No averaging — each figure shows the true trajectory of one specific run.
     Vertical lines at mem/circuit/grok markers shown as dashed segments on the floor.
+    `save_path` : if given, suffixed with `_seed{s}` per figure.
     """
     from mpl_toolkits.mplot3d import Axes3D   # noqa: F401  (registers '3d')
+    markers = markers or {}
 
-    # Stack across seeds using interpolation onto union of epochs (handles adaptive_logging)
-    epochs_ref, mat = _stack_freq_matrix(runs, key=key)
-    if mat is None:
-        print(f'plot_freq_mass_heatmap_3d: no data for {key}'); return
+    valid = [r for r in runs if r.get('history', {}).get('fourier_epoch')
+             and r['history'].get(key)]
+    if not valid:
+        print(f'plot_freq_mass_heatmap_3d_per_seed: no data for {key}'); return
 
-    freqs = np.arange(1, mat.shape[1] + 1)
-    X, Y = np.meshgrid(epochs_ref, freqs)
-    Z = mat.T                                         # (n_freqs, n_snapshots)
-    if log_z:
-        Z = np.log10(np.maximum(np.nan_to_num(Z, nan=1e-10), 1e-10))
+    for r in valid:
+        h    = r['history']
+        seed = r.get('seed', '?')
+        ep   = np.array(h['fourier_epoch'])
+        mat  = np.array(h[key])
+        if mat.size == 0:
+            print(f'  seed {seed} : empty {key} — skip'); continue
 
-    fig = plt.figure(figsize=figsize)
-    ax = fig.add_subplot(111, projection='3d')
-    surf = ax.plot_surface(X, Y, Z, cmap=cmap, edgecolor='none',
-                            alpha=0.92, linewidth=0, antialiased=True,
-                            rstride=1, cstride=1)
-    ax.set_xlabel('epoch'); ax.set_ylabel('frequency index k')
-    ax.set_zlabel('log10(mass)' if log_z else 'mass')
-    if log_x:
-        ax.set_xscale('log')
-    ax.view_init(elev=elev, azim=azim)
+        freqs = np.arange(1, mat.shape[1] + 1)
+        X, Y  = np.meshgrid(ep, freqs)
+        Z = mat.T
+        if log_z:
+            Z = np.log10(np.maximum(np.nan_to_num(Z, nan=1e-10), 1e-10))
 
-    # Markers : dashed vertical lines on the floor (z = zmin)
-    if markers:
+        fig = plt.figure(figsize=figsize)
+        ax  = fig.add_subplot(111, projection='3d')
+        surf = ax.plot_surface(X, Y, Z, cmap=cmap, edgecolor='none',
+                                alpha=0.92, linewidth=0, antialiased=True,
+                                rstride=1, cstride=1)
+        ax.set_xlabel('epoch'); ax.set_ylabel('frequency index k')
+        ax.set_zlabel('log10(mass)' if log_z else 'mass')
+        if log_x:
+            ax.set_xscale('log')
+        ax.view_init(elev=elev, azim=azim)
+
         z_floor = Z.min()
         for label_m, ep_v, color in [
             ('mem',     markers.get('mem'),     '#1f77b4'),
@@ -796,61 +832,74 @@ def plot_freq_mass_heatmap_3d(runs, *, key='wl_frequency_masses',
             if ep_v is None: continue
             ax.plot([ep_v, ep_v], [1, mat.shape[1]], [z_floor, z_floor],
                     color=color, lw=2.2, ls='--', label=f'{label_m}={int(ep_v)}')
-        ax.legend(loc='upper left', fontsize=9, framealpha=0.85)
+        if any(markers.get(k) is not None for k in ('mem', 'circuit', 'grok')):
+            ax.legend(loc='upper left', fontsize=9, framealpha=0.85)
 
-    fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.08,
-                  label='log10(mass)' if log_z else 'mass')
-    ax.set_title(title, fontsize=12, pad=12, fontweight='600')
-    plt.tight_layout()
-    if save_path is not None:
-        plt.savefig(save_path, bbox_inches='tight', facecolor='white')
-    plt.show()
+        fig.colorbar(surf, ax=ax, shrink=0.5, pad=0.08,
+                      label='log10(mass)' if log_z else 'mass')
+        ax.set_title(f'{title} — seed {seed}', fontsize=12, pad=12, fontweight='600')
+        plt.tight_layout()
+        if save_path is not None:
+            sp = str(save_path)
+            if '.' in sp.rsplit('/', 1)[-1]:
+                stem, ext = sp.rsplit('.', 1)
+                sp = f'{stem}_seed{seed}.{ext}'
+            else:
+                sp = f'{sp}_seed{seed}.png'
+            plt.savefig(sp, bbox_inches='tight', facecolor='white')
+        plt.show()
 
 
 # =============================================================================
 # 3D frequency mass — Plotly interactive version
 # =============================================================================
-def plot_freq_mass_heatmap_3d_plotly(runs, *, key='wl_frequency_masses',
-                                       title='Frequency mass — 3D surface (interactive)',
-                                       markers=None, save_path=None,
-                                       log_z=True, log_x=False,
-                                       width=1100, height=750,
-                                       colorscale='Magma'):
-    """3D interactive surface plot (Plotly) : (epoch × freq) → mass. Mean over seeds.
+def plot_freq_mass_heatmap_3d_plotly_per_seed(runs, *, key='wl_frequency_masses',
+                                                title='Frequency mass — 3D surface (interactive, per seed)',
+                                                markers=None, save_path=None,
+                                                log_z=True, log_x=False,
+                                                width=1100, height=750,
+                                                colorscale='Magma'):
+    """3D interactive Plotly surface plot, one figure per seed.
 
-    Rotate / zoom / pan with the mouse. Hover over surface for exact (epoch, k, mass) values.
-    Saves to HTML via `save_path` (e.g. 'freq_mass_3d.html') — fully interactive offline.
+    No averaging — each figure shows the true trajectory of one specific run.
+    Rotate / zoom / pan with the mouse. Hover for exact (epoch, k, mass) values.
+    `save_path` : if given, suffixed with `_seed{s}` per figure (.html for interactive).
     """
     import plotly.graph_objects as go
+    markers = markers or {}
 
-    # Stack across seeds using interpolation onto union of epochs (handles adaptive_logging)
-    epochs_ref, mat = _stack_freq_matrix(runs, key=key)
-    if mat is None:
-        print(f'plot_freq_mass_heatmap_3d_plotly: no data for {key}'); return
+    valid = [r for r in runs if r.get('history', {}).get('fourier_epoch')
+             and r['history'].get(key)]
+    if not valid:
+        print(f'plot_freq_mass_heatmap_3d_plotly_per_seed: no data for {key}'); return []
 
-    freqs = np.arange(1, mat.shape[1] + 1)
-    Z = mat.T                                     # (n_freqs, n_snapshots)
-    if log_z:
-        Z_display = np.log10(np.maximum(np.nan_to_num(Z, nan=1e-10), 1e-10))
-        z_label = 'log10(mass)'
-    else:
-        Z_display = np.nan_to_num(Z, nan=0.0)
-        z_label = 'mass'
+    figures = []
+    for r in valid:
+        h    = r['history']
+        seed = r.get('seed', '?')
+        ep   = np.array(h['fourier_epoch'])
+        mat  = np.array(h[key])
+        if mat.size == 0:
+            print(f'  seed {seed} : empty {key} — skip'); continue
 
-    fig = go.Figure()
-    fig.add_trace(go.Surface(
-        z=Z_display, x=epochs_ref, y=freqs,
-        colorscale=colorscale,
-        colorbar=dict(title=z_label, len=0.8),
-        hovertemplate=(
-            'epoch=%{x:.0f}<br>freq k=%{y}<br>'
-            + ('log10(mass)' if log_z else 'mass')
-            + '=%{z:.3f}<extra></extra>'
-        ),
-    ))
+        freqs = np.arange(1, mat.shape[1] + 1)
+        Z = mat.T
+        if log_z:
+            Z_display = np.log10(np.maximum(np.nan_to_num(Z, nan=1e-10), 1e-10))
+            z_label = 'log10(mass)'
+        else:
+            Z_display = np.nan_to_num(Z, nan=0.0)
+            z_label = 'mass'
 
-    # Vertical markers (mem/circuit/grok) as 3D lines on the floor
-    if markers:
+        fig = go.Figure()
+        fig.add_trace(go.Surface(
+            z=Z_display, x=ep, y=freqs,
+            colorscale=colorscale,
+            colorbar=dict(title=z_label, len=0.8),
+            hovertemplate=('epoch=%{x:.0f}<br>freq k=%{y}<br>'
+                            + z_label + '=%{z:.3f}<extra></extra>'),
+        ))
+
         z_floor = float(Z_display.min())
         z_ceil  = float(Z_display.max())
         for label_m, ep_v, color in [
@@ -867,29 +916,35 @@ def plot_freq_mass_heatmap_3d_plotly(runs, *, key='wl_frequency_masses',
                 hovertemplate=f'{label_m}=%{{x:.0f}}<extra></extra>',
             ))
 
-    fig.update_layout(
-        title=dict(text=title, font=dict(size=14)),
-        scene=dict(
-            xaxis=dict(title='epoch', type='log' if log_x else 'linear'),
-            yaxis=dict(title='frequency index k'),
-            zaxis=dict(title=z_label),
-            camera=dict(eye=dict(x=1.6, y=1.5, z=1.0)),
-            aspectratio=dict(x=1.5, y=1.0, z=0.8),
-        ),
-        width=width, height=height,
-        margin=dict(l=0, r=0, t=40, b=0),
-        legend=dict(x=0.02, y=0.98, bgcolor='rgba(255,255,255,0.85)'),
-    )
+        fig.update_layout(
+            title=dict(text=f'{title} — seed {seed}', font=dict(size=14)),
+            scene=dict(
+                xaxis=dict(title='epoch', type='log' if log_x else 'linear'),
+                yaxis=dict(title='frequency index k'),
+                zaxis=dict(title=z_label),
+                camera=dict(eye=dict(x=1.6, y=1.5, z=1.0)),
+                aspectratio=dict(x=1.5, y=1.0, z=0.8),
+            ),
+            width=width, height=height,
+            margin=dict(l=0, r=0, t=40, b=0),
+            legend=dict(x=0.02, y=0.98, bgcolor='rgba(255,255,255,0.85)'),
+        )
 
-    if save_path is not None:
-        save_path = str(save_path)
-        if save_path.endswith('.html'):
-            fig.write_html(save_path)
-        else:
-            # Pour PNG, plotly nécessite kaleido
-            try: fig.write_image(save_path)
-            except Exception as e:
-                print(f'  write_image failed ({e}) — saving HTML instead')
-                fig.write_html(save_path.rsplit('.', 1)[0] + '.html')
-    fig.show()
-    return fig
+        if save_path is not None:
+            sp = str(save_path)
+            if '.' in sp.rsplit('/', 1)[-1]:
+                stem, ext = sp.rsplit('.', 1)
+                sp = f'{stem}_seed{seed}.{ext}'
+            else:
+                sp = f'{sp}_seed{seed}.html'
+            if sp.endswith('.html'):
+                fig.write_html(sp)
+            else:
+                try: fig.write_image(sp)
+                except Exception as e:
+                    print(f'  write_image failed ({e}) — saving HTML instead')
+                    fig.write_html(sp.rsplit('.', 1)[0] + '.html')
+
+        fig.show()
+        figures.append(fig)
+    return figures
