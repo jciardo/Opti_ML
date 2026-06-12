@@ -15,3 +15,6 @@ __pycache__/
 
 # PyTorch model/checkpoint files, often large and not meant to be pushed
 *.pt
+# Large local snapshots
+baseline/runs_snapshot_*.tar.gz
+*.tar.gz
